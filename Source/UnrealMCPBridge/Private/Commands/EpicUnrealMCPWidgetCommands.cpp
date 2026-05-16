@@ -650,6 +650,11 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPWidgetCommands::HandleRenameWidget(
 	// Rename the UObject
 	Widget->Rename(*NewName, Tree, REN_DontCreateRedirectors);
 
+	// Clear DisplayLabel so the designer falls back to GetName().
+	// UWidget::GetDisplayLabel() returns DisplayLabel if non-empty, so a stale
+	// value makes the hierarchy show the old name even after the UObject rename.
+	Widget->SetDisplayLabel(FString());
+
 	// Update GUID map via the engine's canonical callback — OnVariableRenamed
 	// handles ALL widgets (not just bIsVariable), preserves the existing GUID,
 	// and falls back to OnVariableAdded if the old entry was missing.

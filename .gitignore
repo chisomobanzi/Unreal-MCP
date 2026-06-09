@@ -15,3 +15,4 @@ cli/ue-cli.exe
 
 # Embedded plugin copy (built from Source/ at build time)
 cli/internal/project/plugin/
+.venv/

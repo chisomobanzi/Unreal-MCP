@@ -15,8 +15,6 @@ public class UnrealMCPBridge : ModuleRules
 				System.IO.Path.Combine(ModuleDirectory, "Public/Commands/BlueprintGraph"),
 				System.IO.Path.Combine(ModuleDirectory, "Public/Commands/BlueprintGraph/Nodes"),
 				System.IO.Path.Combine(ModuleDirectory, "Public/Commands/BlueprintGraph/Function"),
-				System.IO.Path.Combine(ModuleDirectory, "Public/Commands/Profiling"),
-				System.IO.Path.Combine(ModuleDirectory, "Public/Commands/Niagara")
 			}
 		);
 
@@ -28,14 +26,6 @@ public class UnrealMCPBridge : ModuleRules
 				System.IO.Path.Combine(ModuleDirectory, "Private/Commands/BlueprintGraph/Nodes"),
 				System.IO.Path.Combine(ModuleDirectory, "Private/Commands/BlueprintGraph/Function"),
 				System.IO.Path.Combine(ModuleDirectory, "Private/Commands/Material"),
-				System.IO.Path.Combine(ModuleDirectory, "Private/Commands/Profiling"),
-				System.IO.Path.Combine(ModuleDirectory, "Private/Commands/Niagara"),
-				System.IO.Path.Combine(ModuleDirectory, "Private/Commands/StateTree"),
-				// Niagara editor private headers — we need NiagaraNodeParameterMapGet/Set
-				// and NiagaraParameterMapHistory, which live under Private/ despite being
-				// referenced by several public headers. UBT lets a downstream module see
-				// an upstream module's Private path when we list it here explicitly.
-				System.IO.Path.Combine(EngineDirectory, "Plugins/FX/Niagara/Source/NiagaraEditor/Private")
 			}
 		);
 
@@ -80,17 +70,7 @@ public class UnrealMCPBridge : ModuleRules
 				"UMGEditor",
 				"LevelEditor",
 				"ImageWrapper",
-				"EnhancedInput",
-				"TraceAnalysis",
-				"TraceServices",
-				"TraceLog",
-				"Niagara",
-				"NiagaraEditor",
-				"NiagaraShader",
-				"StateTreeModule",
-				"StateTreeEditorModule",
-				"GameplayTags",
-				"PropertyBindingUtils"
+				"EnhancedInput"
 			}
 		);
 

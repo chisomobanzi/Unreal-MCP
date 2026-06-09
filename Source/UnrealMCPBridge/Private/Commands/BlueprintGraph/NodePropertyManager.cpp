@@ -389,6 +389,18 @@ bool FNodePropertyManager::SetPrintNodeProperty(
 		}
 	}
 
+	// Generic fallback: find any input pin matching PropertyName and set its DefaultValue
+	FString StringValue;
+	if (Value->TryGetString(StringValue))
+	{
+		UEdGraphPin* Pin = PrintNode->FindPin(FName(*PropertyName), EGPD_Input);
+		if (Pin)
+		{
+			Pin->DefaultValue = StringValue;
+			return true;
+		}
+	}
+
 	return false;
 }
 

@@ -243,7 +243,7 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPMaterialCommands::HandleGetMaterialInfo(
 	if (bIncludeTextures)
 	{
 		TArray<UTexture*> Textures;
-		Material->GetUsedTextures(Textures, EMaterialQualityLevel::High);
+		Material->GetUsedTextures(Textures, EMaterialQualityLevel::High, false, ERHIFeatureLevel::SM5, true);
 		TArray<TSharedPtr<FJsonValue>> TexArr;
 		for (UTexture* T : Textures)
 		{
@@ -556,7 +556,7 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPMaterialCommands::HandleGetMaterialErrors(
 	for (int32 QualityIdx = 0; QualityIdx < EMaterialQualityLevel::Num; ++QualityIdx)
 	{
 		const FMaterialResource* MatResource = Material->GetMaterialResource(
-			ShaderPlatform, static_cast<EMaterialQualityLevel::Type>(QualityIdx));
+			static_cast<ERHIFeatureLevel::Type>(QualityIdx));
 
 		if (!MatResource)
 		{

@@ -4,10 +4,12 @@
 #include "Commands/BlueprintGraph/BPConnector.h"
 #include "Commands/BlueprintGraph/BPVariables.h"
 #include "Commands/BlueprintGraph/EventManager.h"
+#include "Commands/BlueprintGraph/GraphTracer.h"
 #include "Commands/BlueprintGraph/NodeDeleter.h"
 #include "Commands/BlueprintGraph/NodePropertyManager.h"
 #include "Commands/BlueprintGraph/Function/FunctionManager.h"
 #include "Commands/BlueprintGraph/Function/FunctionIO.h"
+#include "Commands/BlueprintGraph/Nodes/EventBindingNodes.h"
 
 FEpicUnrealMCPBlueprintGraphCommands::FEpicUnrealMCPBlueprintGraphCommands()
 {
@@ -28,6 +30,26 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPBlueprintGraphCommands::HandleCommand(
 	else if (CommandType == TEXT("connect_nodes"))
 	{
 		return HandleConnectNodes(Params);
+	}
+	else if (CommandType == TEXT("disconnect_nodes"))
+	{
+		return FBPConnector::DisconnectNodes(Params);
+	}
+	else if (CommandType == TEXT("add_delegate_node"))
+	{
+		return FEventBindingNodes::AddDelegateNode(Params);
+	}
+	else if (CommandType == TEXT("add_parent_call_node"))
+	{
+		return FEventBindingNodes::AddParentCallNode(Params);
+	}
+	else if (CommandType == TEXT("add_custom_event_node"))
+	{
+		return FEventBindingNodes::AddCustomEventNode(Params);
+	}
+	else if (CommandType == TEXT("trace_graph"))
+	{
+		return FGraphTracer::TraceGraph(Params);
 	}
 	else if (CommandType == TEXT("create_variable"))
 	{

@@ -36,9 +36,6 @@ UEpicUnrealMCPBridge::UEpicUnrealMCPBridge()
 	DataAssetCommands = MakeShared<FEpicUnrealMCPDataAssetCommands>();
 	WidgetCommands = MakeShared<FEpicUnrealMCPWidgetCommands>();
 	EnhancedInputCommands = MakeShared<FEpicUnrealMCPEnhancedInputCommands>();
-	ProfilingCommands = MakeShared<FEpicUnrealMCPProfilingCommands>();
-	NiagaraCommands = MakeShared<FEpicUnrealMCPNiagaraCommands>();
-	StateTreeCommands = MakeShared<FEpicUnrealMCPStateTreeCommands>();
 }
 
 UEpicUnrealMCPBridge::~UEpicUnrealMCPBridge()
@@ -52,7 +49,6 @@ UEpicUnrealMCPBridge::~UEpicUnrealMCPBridge()
 	DataAssetCommands.Reset();
 	WidgetCommands.Reset();
 	EnhancedInputCommands.Reset();
-	ProfilingCommands.Reset();
 }
 
 void UEpicUnrealMCPBridge::Initialize(FSubsystemCollectionBase& Collection)
@@ -82,13 +78,27 @@ void UEpicUnrealMCPBridge::Initialize(FSubsystemCollectionBase& Collection)
 
 	FIPv4Address::Parse(MCP_SERVER_HOST, ServerAddress);
 
+	// Only the interactive editor should run the bridge. Cook/package runs as a commandlet
+	// that loads this plugin too — if it starts the server and writes/deletes the SHARED
+	// Saved/UnrealMCP/port.txt, it clobbers the live editor's bridge registration and the
+	// MCP client drops to the default port. Skip the bridge entirely in commandlets.
+	if (IsRunningCommandlet())
+	{
+		UE_LOG(LogTemp, Display, TEXT("UnrealMCP: commandlet/cook — not starting bridge (keeps the editor's port.txt intact)"));
+		return;
+	}
+
 	StartServer();
 }
 
 void UEpicUnrealMCPBridge::Deinitialize()
 {
 	UE_LOG(LogTemp, Display, TEXT("UnrealMCP: Shutting down"));
-	DeletePortFile();
+	// Don't let a commandlet's teardown delete the shared port.txt the editor owns.
+	if (!IsRunningCommandlet())
+	{
+		DeletePortFile();
+	}
 	StopServer();
 }
 
@@ -554,6 +564,13 @@ FString UEpicUnrealMCPBridge::ExecuteCommand(
 	{
 		TSharedPtr<FJsonObject> ResponseJson = MakeShareable(new FJsonObject);
 
+		// Run as an unattended script: editor code that would pop a modal
+		// dialog (on-save Data Validation slow-task, checkout prompts, etc.)
+		// takes its non-interactive path instead. A modal here either hangs
+		// the bridge until the 120s timeout or re-enters Slate mid-command
+		// and crashes (FindWindowByPlatformWindow assert during bulk saves).
+		TGuardValue<bool> UnattendedGuard(GIsRunningUnattendedScript, true);
+
 		try
 		{
 			TSharedPtr<FJsonObject> ResultJson;
@@ -688,6 +705,11 @@ FString UEpicUnrealMCPBridge::ExecuteCommand(
 			}
 			else if (CommandType == TEXT("add_blueprint_node") ||
 				CommandType == TEXT("connect_nodes") ||
+				CommandType == TEXT("disconnect_nodes") ||
+				CommandType == TEXT("add_delegate_node") ||
+				CommandType == TEXT("add_parent_call_node") ||
+				CommandType == TEXT("add_custom_event_node") ||
+				CommandType == TEXT("trace_graph") ||
 				CommandType == TEXT("create_variable") ||
 				CommandType == TEXT("set_blueprint_variable_properties") ||
 				CommandType == TEXT("add_event_node") ||
@@ -711,7 +733,8 @@ FString UEpicUnrealMCPBridge::ExecuteCommand(
 				CommandType == TEXT("set_widget_properties") ||
 				CommandType == TEXT("get_slot_properties") ||
 				CommandType == TEXT("set_slot_properties") ||
-				CommandType == TEXT("list_widget_types"))
+				CommandType == TEXT("list_widget_types") ||
+				CommandType == TEXT("screenshot_widget"))
 			{
 				ResultJson = WidgetCommands->HandleCommand(CommandType, Params);
 			}
@@ -738,50 +761,6 @@ FString UEpicUnrealMCPBridge::ExecuteCommand(
 				CommandType == TEXT("list_input_keys"))
 			{
 				ResultJson = EnhancedInputCommands->HandleCommand(CommandType, Params);
-			}
-			else if (CommandType == TEXT("performance_start_trace") ||
-				CommandType == TEXT("performance_stop_trace") ||
-				CommandType == TEXT("performance_analyze_insight"))
-			{
-				ResultJson = ProfilingCommands->HandleCommand(CommandType, Params);
-			}
-			else if (CommandType.StartsWith(TEXT("create_niagara")) ||
-				CommandType.StartsWith(TEXT("get_niagara")) ||
-				CommandType.StartsWith(TEXT("list_niagara")) ||
-				CommandType.StartsWith(TEXT("delete_niagara")) ||
-				CommandType.StartsWith(TEXT("compile_niagara")) ||
-				CommandType.StartsWith(TEXT("add_niagara")) ||
-				CommandType.StartsWith(TEXT("remove_niagara")) ||
-				CommandType.StartsWith(TEXT("set_niagara")) ||
-				CommandType.StartsWith(TEXT("spawn_niagara")) ||
-				CommandType.StartsWith(TEXT("control_niagara")) ||
-				CommandType.StartsWith(TEXT("link_niagara")) ||
-				CommandType.StartsWith(TEXT("duplicate_niagara")) ||
-				CommandType.StartsWith(TEXT("reorder_niagara")) ||
-				CommandType.StartsWith(TEXT("rename_niagara")) ||
-				CommandType.StartsWith(TEXT("search_niagara")) ||
-				CommandType.StartsWith(TEXT("connect_niagara")) ||
-				CommandType.StartsWith(TEXT("disconnect_niagara")) ||
-				CommandType.StartsWith(TEXT("describe_niagara")) ||
-				CommandType.StartsWith(TEXT("trace_niagara")) ||
-				CommandType.StartsWith(TEXT("validate_niagara")) ||
-				CommandType.StartsWith(TEXT("apply_niagara")) ||
-				CommandType.StartsWith(TEXT("apply_and_save_niagara")) ||
-				CommandType.StartsWith(TEXT("clear_niagara")) ||
-				CommandType.StartsWith(TEXT("find_niagara")) ||
-				CommandType.StartsWith(TEXT("resolve_niagara")))
-			{
-				ResultJson = NiagaraCommands->HandleCommand(CommandType, Params);
-			}
-			else if (CommandType.StartsWith(TEXT("create_statetree")) ||
-				CommandType.StartsWith(TEXT("get_statetree")) ||
-				CommandType.StartsWith(TEXT("list_statetree")) ||
-				CommandType.StartsWith(TEXT("compile_statetree")) ||
-				CommandType.StartsWith(TEXT("add_statetree")) ||
-				CommandType.StartsWith(TEXT("remove_statetree")) ||
-				CommandType.StartsWith(TEXT("set_statetree")))
-			{
-				ResultJson = StateTreeCommands->HandleCommand(CommandType, Params);
 			}
 			else
 			{
@@ -823,6 +802,10 @@ FString UEpicUnrealMCPBridge::ExecuteCommand(
 			{
 				ResponseJson->SetStringField(TEXT("status"), TEXT("error"));
 				ResponseJson->SetStringField(TEXT("error"), ErrorMessage);
+				// Keep the handler's full payload: error responses often carry
+				// diagnostics beyond the message (available_pins on a pin miss,
+				// candidate delegate names, etc.)
+				ResponseJson->SetObjectField(TEXT("result"), ResultJson);
 			}
 		}
 		catch (const std::exception& e)

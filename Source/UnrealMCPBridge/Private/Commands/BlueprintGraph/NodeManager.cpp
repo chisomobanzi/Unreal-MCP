@@ -169,6 +169,14 @@ TSharedPtr<FJsonObject> FBlueprintNodeManager::AddNode(const TSharedPtr<FJsonObj
 	{
 		NewNode = FUtilityNodeCreator::CreateSpawnActorNode(Graph, NodeParams);
 	}
+	else if (NodeType.Equals(TEXT("ComponentBoundEvent"), ESearchCase::IgnoreCase))
+	{
+		NewNode = FUtilityNodeCreator::CreateComponentBoundEventNode(Graph, NodeParams);
+	}
+	else if (NodeType.Equals(TEXT("GetSubsystem"), ESearchCase::IgnoreCase))
+	{
+		NewNode = FUtilityNodeCreator::CreateGetSubsystemNode(Graph, NodeParams);
+	}
 	// Casting Nodes
 	else if (NodeType.Equals(TEXT("DynamicCast"), ESearchCase::IgnoreCase))
 	{
@@ -608,7 +616,11 @@ TSharedPtr<FJsonObject> FBlueprintNodeManager::CreateSuccessResponse(const UK2No
 {
 	TSharedPtr<FJsonObject> Response = MakeShareable(new FJsonObject);
 	Response->SetBoolField(TEXT("success"), true);
-	Response->SetStringField(TEXT("node_id"), Node->GetName());
+	// GUID, matching every other command's node ids (connect, trace,
+	// broken_links). Lookups accept the object name too, so node_name stays
+	// available for callers that used the old format.
+	Response->SetStringField(TEXT("node_id"), Node->NodeGuid.ToString());
+	Response->SetStringField(TEXT("node_name"), Node->GetName());
 	Response->SetStringField(TEXT("node_type"), NodeType);
 	Response->SetNumberField(TEXT("pos_x"), Node->NodePosX);
 	Response->SetNumberField(TEXT("pos_y"), Node->NodePosY);

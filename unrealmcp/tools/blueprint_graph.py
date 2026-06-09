@@ -24,6 +24,9 @@ def add_blueprint_node(
     target_function: str = "",
     target_blueprint: str = "",
     function_name: str = "",
+    component_name: str = "",
+    delegate_name: str = "",
+    subsystem_class: str = "",
 ) -> str:
     """Add a node to a Blueprint graph.
 
@@ -31,12 +34,14 @@ def add_blueprint_node(
       FLOW:      Branch, Comparison, Switch, SwitchEnum, SwitchInteger, ExecutionSequence
       DATA:      VariableGet, VariableSet, MakeArray
       CASTING:   DynamicCast, ClassDynamicCast, CastByteToEnum
-      UTILITY:   Print, CallFunction, Select, SpawnActor
+      UTILITY:   Print, CallFunction, Select, SpawnActor, ComponentBoundEvent, GetSubsystem
       SPECIAL:   Timeline, GetDataTableRow, AddComponentByClass, Self, Knot
       EVENT:     Event (specify event_type: BeginPlay, Tick, Destroyed, etc.)
 
     Extra args are only needed for specific node types (message for Print,
-    variable_name for Variable nodes, target_function for CallFunction, etc.).
+    variable_name for Variable nodes, target_function for CallFunction,
+    component_name + delegate_name for ComponentBoundEvent,
+    subsystem_class for GetSubsystem, etc.).
     """
     params: Dict[str, Any] = {"pos_x": pos_x, "pos_y": pos_y}
     # Only include optional fields when set — keeps the wire payload small
@@ -47,6 +52,9 @@ def add_blueprint_node(
         ("target_function", target_function),
         ("target_blueprint", target_blueprint),
         ("function_name", function_name),
+        ("component_name", component_name),
+        ("delegate_name", delegate_name),
+        ("subsystem_class", subsystem_class),
     ]:
         if val:
             params[key] = val
@@ -69,6 +77,12 @@ def connect_blueprint_nodes(
 ) -> str:
     """Connect two nodes in a Blueprint graph.
 
+    Connections go through the K2 schema: invalid links are rejected with the
+    schema's reason, and single-link pins (exec outputs, data inputs) get
+    their existing link auto-broken instead of double-linking — any broken
+    links come back under "broken_links". Pin-not-found errors list the
+    node's available pins.
+
     Args:
         source_node_id: GUID of the source node
         source_pin_name: Output pin name on source
@@ -86,6 +100,36 @@ def connect_blueprint_nodes(
     if function_name:
         params["function_name"] = function_name
     return _call("connect_nodes", params)
+
+
+@mcp.tool()
+def disconnect_blueprint_nodes(
+    blueprint_name: str,
+    source_node_id: str,
+    source_pin_name: str,
+    target_node_id: str = "",
+    target_pin_name: str = "",
+    function_name: str = "",
+) -> str:
+    """Break Blueprint pin connections.
+
+    With target_node_id + target_pin_name, breaks just that one link;
+    otherwise breaks every link on the named pin. The pin may be given from
+    either end (output or input).
+    """
+    params: Dict[str, Any] = {
+        "blueprint_name": blueprint_name,
+        "source_node_id": source_node_id,
+        "source_pin_name": source_pin_name,
+    }
+    for key, val in [
+        ("target_node_id", target_node_id),
+        ("target_pin_name", target_pin_name),
+        ("function_name", function_name),
+    ]:
+        if val:
+            params[key] = val
+    return _call("disconnect_nodes", params)
 
 
 @mcp.tool()
@@ -168,13 +212,155 @@ def add_event_node(
     pos_x: float = 0,
     pos_y: float = 0,
 ) -> str:
-    """Add an event node (ReceiveBeginPlay, ReceiveTick, ReceiveDestroyed, etc.)."""
+    """Add an event override node to the event graph.
+
+    Handles parent-class events (C++ BlueprintImplementableEvent /
+    BlueprintNativeEvent, parent-Blueprint events) and interface events —
+    the node is placed as a proper override of the declaring class. Friendly
+    aliases work: BeginPlay, EndPlay, Tick, ActorBeginOverlap, Hit, etc.
+    Returns the existing node if the event is already placed.
+
+    For NEW events that don't exist on any parent, use add_custom_event_node.
+    For binding to delegates (OnX events of components), use add_delegate_node.
+    """
     return _call("add_event_node", {
         "blueprint_name": blueprint_name,
         "event_name": event_name,
         "pos_x": pos_x,
         "pos_y": pos_y,
     })
+
+
+@mcp.tool()
+def add_custom_event_node(
+    blueprint_name: str,
+    event_name: str,
+    parameters: Optional[list] = None,
+    pos_x: float = 0,
+    pos_y: float = 0,
+) -> str:
+    """Add a custom event node, optionally with parameters.
+
+    parameters: list of {"name": str, "type": str, "is_array": bool} dicts.
+    Types: bool, byte, int, int64, float, string, name, text, vector,
+    rotator, transform, linearcolor, object:<Class>, class:<Class>,
+    struct:<Path>, enum:<Path>.
+
+    Example: parameters=[{"name": "Amount", "type": "float"},
+                         {"name": "Source", "type": "object:Actor"}]
+    """
+    params: Dict[str, Any] = {
+        "blueprint_name": blueprint_name,
+        "event_name": event_name,
+        "pos_x": pos_x,
+        "pos_y": pos_y,
+    }
+    if parameters:
+        params["parameters"] = parameters
+    return _call("add_custom_event_node", params)
+
+
+@mcp.tool()
+def add_delegate_node(
+    blueprint_name: str,
+    delegate_name: str,
+    owner_class: str = "self",
+    mode: str = "Assign",
+    event_name: str = "",
+    function_name: str = "",
+    pos_x: float = 0,
+    pos_y: float = 0,
+) -> str:
+    """Add a multicast-delegate node (Bind/Unbind/Call/Assign).
+
+    Modes:
+      Assign (default) — Bind node + a matching custom event created from the
+        delegate signature, pre-connected. The classic "Assign OnX" action.
+      Add / Remove / Call — just that delegate node.
+
+    owner_class: class owning the delegate property. "self" = this Blueprint;
+    otherwise a C++ class name (e.g. "TutorAudioStreamComponent") or a
+    /Game/... Blueprint path. When the delegate is not on self, connect an
+    instance to the node's target pin afterwards.
+
+    event_name: name for the bound event in Assign mode (default
+    <DelegateName>_Event). Unknown delegate names return the class's
+    available delegates in the error.
+    """
+    params: Dict[str, Any] = {
+        "blueprint_name": blueprint_name,
+        "delegate_name": delegate_name,
+        "owner_class": owner_class,
+        "mode": mode,
+        "pos_x": pos_x,
+        "pos_y": pos_y,
+    }
+    for key, val in [("event_name", event_name), ("function_name", function_name)]:
+        if val:
+            params[key] = val
+    return _call("add_delegate_node", params)
+
+
+@mcp.tool()
+def add_parent_call_node(
+    blueprint_name: str,
+    function_name: str,
+    graph_function_name: str = "",
+    pos_x: float = 0,
+    pos_y: float = 0,
+) -> str:
+    """Add a "Call to Parent Function" node (e.g. Parent: BeginPlay).
+
+    function_name: the parent-class function to call.
+    graph_function_name: which graph to place it in (empty = EventGraph).
+    """
+    params: Dict[str, Any] = {
+        "blueprint_name": blueprint_name,
+        "function_name": function_name,
+        "pos_x": pos_x,
+        "pos_y": pos_y,
+    }
+    if graph_function_name:
+        params["graph_function_name"] = graph_function_name
+    return _call("add_parent_call_node", params)
+
+
+@mcp.tool()
+def trace_blueprint_graph(
+    blueprint_name: str,
+    start_node_id: str = "",
+    event_name: str = "",
+    function_name: str = "",
+    direction: str = "forward",
+    max_depth: int = 50,
+    include_data: bool = True,
+) -> str:
+    """Trace the execution path through a Blueprint graph.
+
+    Follows exec pins from a start node or event and returns the ordered
+    chain — "what runs after X?" (forward) or "what leads to X?" (backward)
+    — without dumping the whole graph.
+
+    Give either start_node_id (searched across all graphs) or event_name
+    (matches overridden events, custom events, and aliases like "BeginPlay").
+    Returns a nested trace tree plus linear_sequence, the flat straight-line
+    prefix of titles. include_data adds each node's data inputs (literals or
+    the feeding node).
+    """
+    params: Dict[str, Any] = {
+        "blueprint_name": blueprint_name,
+        "direction": direction,
+        "max_depth": max_depth,
+        "include_data": include_data,
+    }
+    for key, val in [
+        ("start_node_id", start_node_id),
+        ("event_name", event_name),
+        ("function_name", function_name),
+    ]:
+        if val:
+            params[key] = val
+    return _call("trace_graph", params)
 
 
 @mcp.tool()

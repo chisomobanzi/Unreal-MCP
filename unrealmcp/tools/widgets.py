@@ -175,3 +175,38 @@ def list_widget_types(filter: str = "", include_abstract: bool = False, panels_o
         "include_abstract": include_abstract,
         "panels_only": panels_only,
     })
+
+
+@mcp.tool()
+def screenshot_widget(
+    widget_blueprint_path: str,
+    width: int = 0,
+    height: int = 0,
+    output_path: str = "",
+    include_layout: bool = False,
+    design_time: bool = True,
+) -> str:
+    """Render a Widget Blueprint off-screen to a PNG — like a browser
+    screenshot for UMG. View the file, tweak styles with
+    set_widget_properties, re-shoot, repeat.
+
+    Renders the designer state (PreConstruct runs, Construct/game logic does
+    not), so it works without PIE. width/height 0 = the widget's desired
+    size, falling back to 1280x720 for fill-screen widgets. include_layout
+    adds each named widget's painted rectangle {name, class, x, y, width,
+    height, visible} for inspect-style checks. design_time=False runs
+    Construct — only for widgets whose Construct is editor-safe. Default
+    output: Saved/Screenshots/Widgets/<name>.png.
+    """
+    params = {
+        "widget_blueprint_path": widget_blueprint_path,
+        "include_layout": include_layout,
+        "design_time": design_time,
+    }
+    if width:
+        params["width"] = width
+    if height:
+        params["height"] = height
+    if output_path:
+        params["output_path"] = output_path
+    return _call("screenshot_widget", params)

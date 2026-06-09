@@ -45,6 +45,7 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPWidgetCommands::HandleCommand(
 	if (CommandType == TEXT("get_slot_properties"))    return HandleGetSlotProperties(Params);
 	if (CommandType == TEXT("set_slot_properties"))    return HandleSetSlotProperties(Params);
 	if (CommandType == TEXT("list_widget_types"))      return HandleListWidgetTypes(Params);
+	if (CommandType == TEXT("screenshot_widget"))      return HandleScreenshotWidget(Params);
 
 	return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
 		FString::Printf(TEXT("Unknown widget command: %s"), *CommandType));
@@ -1110,5 +1111,189 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPWidgetCommands::HandleListWidgetTypes(
 		Result->SetStringField(TEXT("filter"), Filter);
 	if (bPanelsOnly)
 		Result->SetBoolField(TEXT("panels_only"), true);
+	return Result;
+}
+
+// ===========================================================================
+// screenshot_widget — off-screen render of a Widget Blueprint to PNG
+// ===========================================================================
+#include "Blueprint/UserWidget.h"
+#include "Slate/WidgetRenderer.h"
+#include "Engine/TextureRenderTarget2D.h"
+#include "TextureResource.h"
+#include "RenderingThread.h"
+#include "IImageWrapperModule.h"
+#include "IImageWrapper.h"
+#include "Misc/FileHelper.h"
+#include "HAL/FileManager.h"
+#include "Modules/ModuleManager.h"
+#include "Widgets/SWidget.h"
+#include "Editor.h"
+
+TSharedPtr<FJsonObject> FEpicUnrealMCPWidgetCommands::HandleScreenshotWidget(
+	const TSharedPtr<FJsonObject>& Params)
+{
+	FString BlueprintPath;
+	if (!Params->TryGetStringField(TEXT("widget_blueprint_path"), BlueprintPath))
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'widget_blueprint_path' parameter"));
+	}
+
+	UWidgetBlueprint* WBP = LoadWidgetBlueprint(BlueprintPath);
+	if (!WBP)
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+			FString::Printf(TEXT("Widget Blueprint not found: %s"), *BlueprintPath));
+	}
+
+	UClass* GeneratedClass = WBP->GeneratedClass;
+	if (!GeneratedClass || !GeneratedClass->IsChildOf(UUserWidget::StaticClass()))
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Asset has no generated UUserWidget class (compile the widget first)"));
+	}
+
+	UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+	if (!World)
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("No editor world available"));
+	}
+
+	UUserWidget* Widget = CreateWidget<UUserWidget>(World, GeneratedClass);
+	if (!Widget)
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to instantiate widget"));
+	}
+
+	// Designer-state preview by default: PreConstruct(design-time) runs but
+	// Construct/game logic and animations do not — same as the UMG Designer.
+	// design_time=false renders live (Construct runs; only safe for widgets
+	// whose Construct doesn't touch game systems).
+	bool bDesignTime = true;
+	Params->TryGetBoolField(TEXT("design_time"), bDesignTime);
+	if (bDesignTime)
+	{
+		Widget->SetDesignerFlags(EWidgetDesignFlags::Designing);
+	}
+
+	TSharedRef<SWidget> SlateWidget = Widget->TakeWidget();
+
+	double WidthParam = 0.0, HeightParam = 0.0;
+	Params->TryGetNumberField(TEXT("width"), WidthParam);
+	Params->TryGetNumberField(TEXT("height"), HeightParam);
+
+	FVector2D DrawSize(WidthParam, HeightParam);
+	if (DrawSize.X <= 1.0 || DrawSize.Y <= 1.0)
+	{
+		// No explicit size: use the widget's desired size, falling back to a
+		// sane default for fill-screen widgets that have no intrinsic size
+		SlateWidget->SlatePrepass(1.0f);
+		DrawSize = FVector2D(SlateWidget->GetDesiredSize());
+		if (DrawSize.X < 8.0 || DrawSize.Y < 8.0)
+		{
+			DrawSize = FVector2D(1280.0, 720.0);
+		}
+	}
+	DrawSize.X = FMath::Clamp(DrawSize.X, 8.0, 8192.0);
+	DrawSize.Y = FMath::Clamp(DrawSize.Y, 8.0, 8192.0);
+
+	FWidgetRenderer* Renderer = new FWidgetRenderer(/*bUseGammaSpace*/ true);
+	UTextureRenderTarget2D* RenderTarget = FWidgetRenderer::CreateTargetFor(DrawSize, TF_Bilinear, /*bUseGammaCorrection*/ true);
+	if (!RenderTarget)
+	{
+		delete Renderer;
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to create render target"));
+	}
+
+	// Draw twice: the first pass establishes layout caches (text measurement,
+	// retainer setup); the second produces the final image
+	Renderer->DrawWidget(RenderTarget, SlateWidget, DrawSize, 0.0f);
+	FlushRenderingCommands();
+	Renderer->DrawWidget(RenderTarget, SlateWidget, DrawSize, 0.0f);
+	FlushRenderingCommands();
+
+	TArray<FColor> Pixels;
+	FTextureRenderTargetResource* Resource = RenderTarget->GameThread_GetRenderTargetResource();
+	const bool bRead = Resource && Resource->ReadPixels(Pixels);
+	delete Renderer;
+
+	const int32 Width = static_cast<int32>(DrawSize.X);
+	const int32 Height = static_cast<int32>(DrawSize.Y);
+
+	if (!bRead || Pixels.Num() != Width * Height)
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to read render target pixels"));
+	}
+
+	for (FColor& Pixel : Pixels)
+	{
+		Pixel.A = 255;
+	}
+
+	IImageWrapperModule& ImageWrapperModule =
+		FModuleManager::LoadModuleChecked<IImageWrapperModule>(FName("ImageWrapper"));
+	TSharedPtr<IImageWrapper> PngWriter = ImageWrapperModule.CreateImageWrapper(EImageFormat::PNG);
+	if (!PngWriter.IsValid() ||
+		!PngWriter->SetRaw(Pixels.GetData(), Pixels.Num() * sizeof(FColor), Width, Height, ERGBFormat::BGRA, 8))
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to compress image to PNG"));
+	}
+
+	FString OutputPath;
+	if (!Params->TryGetStringField(TEXT("output_path"), OutputPath) || OutputPath.IsEmpty())
+	{
+		OutputPath = FPaths::ProjectSavedDir() / TEXT("Screenshots/Widgets") / (WBP->GetName() + TEXT(".png"));
+	}
+	IFileManager::Get().MakeDirectory(*FPaths::GetPath(OutputPath), true);
+
+	const TArray64<uint8> PNGData = PngWriter->GetCompressed();
+	if (!FFileHelper::SaveArrayToFile(PNGData, *OutputPath))
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+			FString::Printf(TEXT("Failed to save screenshot to: %s"), *OutputPath));
+	}
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetBoolField(TEXT("success"), true);
+	Result->SetStringField(TEXT("file_path"), FPaths::ConvertRelativePathToFull(OutputPath));
+	Result->SetNumberField(TEXT("width"), Width);
+	Result->SetNumberField(TEXT("height"), Height);
+
+	// Per-widget layout rectangles from the painted geometry — lets a styling
+	// loop know where each named widget landed without pixel-hunting
+	bool bIncludeLayout = false;
+	Params->TryGetBoolField(TEXT("include_layout"), bIncludeLayout);
+	if (bIncludeLayout && Widget->WidgetTree)
+	{
+		TArray<TSharedPtr<FJsonValue>> Layout;
+		TArray<UWidget*> AllWidgets;
+		Widget->WidgetTree->GetAllWidgets(AllWidgets);
+		for (UWidget* Child : AllWidgets)
+		{
+			if (!Child)
+			{
+				continue;
+			}
+			TSharedPtr<SWidget> ChildSlate = Child->GetCachedWidget();
+			if (!ChildSlate.IsValid())
+			{
+				continue;
+			}
+			const FGeometry& Geo = ChildSlate->GetCachedGeometry();
+			const FVector2D Pos = FVector2D(Geo.GetAbsolutePosition());
+			const FVector2D Size = FVector2D(Geo.GetAbsoluteSize());
+
+			TSharedPtr<FJsonObject> Entry = MakeShared<FJsonObject>();
+			Entry->SetStringField(TEXT("name"), Child->GetName());
+			Entry->SetStringField(TEXT("class"), Child->GetClass()->GetName());
+			Entry->SetNumberField(TEXT("x"), Pos.X);
+			Entry->SetNumberField(TEXT("y"), Pos.Y);
+			Entry->SetNumberField(TEXT("width"), Size.X);
+			Entry->SetNumberField(TEXT("height"), Size.Y);
+			Entry->SetBoolField(TEXT("visible"), ChildSlate->GetVisibility().IsVisible());
+			Layout.Add(MakeShared<FJsonValueObject>(Entry));
+		}
+		Result->SetArrayField(TEXT("layout"), Layout);
+	}
+
 	return Result;
 }

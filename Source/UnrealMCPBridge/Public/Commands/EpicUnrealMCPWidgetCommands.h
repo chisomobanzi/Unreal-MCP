@@ -53,6 +53,13 @@ private:
 	// -----------------------------------------------------------------
 	TSharedPtr<FJsonObject> HandleListWidgetTypes(const TSharedPtr<FJsonObject>& Params);
 
+	/**
+	 * Renders a Widget Blueprint off-screen to a PNG (designer-state preview,
+	 * no game logic), optionally returning per-widget layout rectangles —
+	 * the Playwright-style screenshot+inspect primitive for UI iteration.
+	 */
+	TSharedPtr<FJsonObject> HandleScreenshotWidget(const TSharedPtr<FJsonObject>& Params);
+
 	// -----------------------------------------------------------------
 	// Internal helpers
 	// -----------------------------------------------------------------

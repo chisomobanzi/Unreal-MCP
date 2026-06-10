@@ -10,7 +10,7 @@
 
 namespace
 {
-	UBlueprint* LoadBlueprintShared(const FString& BlueprintName)
+	UBlueprint* LoadBlueprintForTrace(const FString& BlueprintName)
 	{
 		FString BlueprintPath = BlueprintName;
 		if (!BlueprintPath.StartsWith(TEXT("/")))
@@ -252,7 +252,7 @@ TSharedPtr<FJsonObject> FGraphTracer::TraceGraph(const TSharedPtr<FJsonObject>& 
 	Params->TryGetNumberField(TEXT("max_depth"), MaxDepth);
 	Ctx.MaxDepth = FMath::Clamp(static_cast<int32>(MaxDepth), 1, 200);
 
-	UBlueprint* Blueprint = LoadBlueprintShared(BlueprintName);
+	UBlueprint* Blueprint = LoadBlueprintForTrace(BlueprintName);
 	if (!Blueprint)
 	{
 		Result->SetBoolField(TEXT("success"), false);

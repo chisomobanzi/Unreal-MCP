@@ -16,7 +16,7 @@
 
 namespace
 {
-	UBlueprint* LoadBlueprintShared(const FString& BlueprintName)
+	UBlueprint* LoadBlueprintForBinding(const FString& BlueprintName)
 	{
 		FString BlueprintPath = BlueprintName;
 		if (!BlueprintPath.StartsWith(TEXT("/")))
@@ -319,7 +319,7 @@ TSharedPtr<FJsonObject> FEventBindingNodes::AddDelegateNode(const TSharedPtr<FJs
 	FString FunctionName;
 	Params->TryGetStringField(TEXT("function_name"), FunctionName);
 
-	UBlueprint* Blueprint = LoadBlueprintShared(BlueprintName);
+	UBlueprint* Blueprint = LoadBlueprintForBinding(BlueprintName);
 	if (!Blueprint)
 	{
 		return MakeError(FString::Printf(TEXT("Blueprint not found: %s"), *BlueprintName));
@@ -437,7 +437,7 @@ TSharedPtr<FJsonObject> FEventBindingNodes::AddParentCallNode(const TSharedPtr<F
 	FString GraphFunctionName;
 	Params->TryGetStringField(TEXT("graph_function_name"), GraphFunctionName);
 
-	UBlueprint* Blueprint = LoadBlueprintShared(BlueprintName);
+	UBlueprint* Blueprint = LoadBlueprintForBinding(BlueprintName);
 	if (!Blueprint)
 	{
 		return MakeError(FString::Printf(TEXT("Blueprint not found: %s"), *BlueprintName));
@@ -490,7 +490,7 @@ TSharedPtr<FJsonObject> FEventBindingNodes::AddCustomEventNode(const TSharedPtr<
 		return MakeError(TEXT("Missing 'event_name' parameter"));
 	}
 
-	UBlueprint* Blueprint = LoadBlueprintShared(BlueprintName);
+	UBlueprint* Blueprint = LoadBlueprintForBinding(BlueprintName);
 	if (!Blueprint)
 	{
 		return MakeError(FString::Printf(TEXT("Blueprint not found: %s"), *BlueprintName));

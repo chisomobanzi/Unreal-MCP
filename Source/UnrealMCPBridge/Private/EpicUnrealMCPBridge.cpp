@@ -88,14 +88,24 @@ void UEpicUnrealMCPBridge::Initialize(FSubsystemCollectionBase& Collection)
 		return;
 	}
 
+	// Same problem for secondary HEADLESS editor instances (automation test
+	// runs via UnrealEditor-Cmd): they'd port-scan past the live editor, then
+	// OVERWRITE and later DELETE the shared port.txt. -NoMCP opts a run out.
+	if (FParse::Param(FCommandLine::Get(), TEXT("NoMCP")))
+	{
+		UE_LOG(LogTemp, Display, TEXT("UnrealMCP: -NoMCP on command line — not starting bridge"));
+		return;
+	}
+
 	StartServer();
 }
 
 void UEpicUnrealMCPBridge::Deinitialize()
 {
 	UE_LOG(LogTemp, Display, TEXT("UnrealMCP: Shutting down"));
-	// Don't let a commandlet's teardown delete the shared port.txt the editor owns.
-	if (!IsRunningCommandlet())
+	// Don't let a commandlet's (or -NoMCP run's) teardown delete the shared
+	// port.txt the live editor owns.
+	if (!IsRunningCommandlet() && !FParse::Param(FCommandLine::Get(), TEXT("NoMCP")))
 	{
 		DeletePortFile();
 	}

@@ -738,7 +738,29 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleSetActorProperty(
 	if (TopLevelProp)
 	{
 		FPropertyChangedEvent ChangeEvent(TopLevelProp, EPropertyChangeType::ValueSet);
-		TargetObject->PostEditChangeProperty(ChangeEvent);
+
+		// AActor::PostEditChangeProperty() unconditionally calls RerunConstructionScripts(),
+		// which can null-deref inside a fragile Blueprint UserConstructionScript and hard-crash
+		// the editor (SIGSEGV at ActorConstruction.cpp:596). The value is already written by
+		// SetPropertyAtPath above and the package is marked dirty below, so it persists regardless
+		// of the notify. Default to a crash-safe notify; only run the full actor notify (with the
+		// construction-script rerun) when the caller explicitly opts in via "rerun_construction_script".
+		bool bRerunConstruction = false;
+		Params->TryGetBoolField(TEXT("rerun_construction_script"), bRerunConstruction);
+
+		if (TargetComponent)
+		{
+			// Component property: notify the component so its render/state updates live.
+			// Does not force the owning actor's construction script to rerun.
+			TargetComponent->PostEditChangeProperty(ChangeEvent);
+		}
+		else if (bRerunConstruction)
+		{
+			// Opt-in full actor notify (reruns the construction script). Use only when the target
+			// Blueprint's construction script is known-safe and a live editor rebuild is needed.
+			TargetObject->PostEditChangeProperty(ChangeEvent);
+		}
+		// else: actor property in crash-safe mode — value is written + package dirtied, no rerun.
 	}
 
 	if (TargetActor->GetLevel())

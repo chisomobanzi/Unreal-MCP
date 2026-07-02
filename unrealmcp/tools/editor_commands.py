@@ -216,11 +216,16 @@ def get_blueprint_material_info(blueprint_name: str) -> str:
 # -- Screenshot --------------------------------------------------------------
 
 @mcp.tool()
-def take_screenshot(file_path: str = "", mode: str = "viewport") -> str:
+def take_screenshot(file_path: str = "", mode: str = "viewport", max_width: int = 0) -> str:
     """Capture the editor to a PNG.
 
     mode "viewport" captures the level viewport; "window" captures the
     entire active editor window (material editor, BP graph, widget designer, etc.).
+
+    The level viewport is redrawn and the render queue flushed before
+    capture, so scene changes made just beforehand are included (no stale
+    frame). max_width (>= 64) downscales the PNG proportionally before
+    encoding — use ~1280 for verify loops to cut image-token cost.
 
     Returns the file path, width, and height. Use Read tool to view the image.
     """
@@ -229,4 +234,6 @@ def take_screenshot(file_path: str = "", mode: str = "viewport") -> str:
         params["file_path"] = file_path
     if mode != "viewport":
         params["mode"] = mode
+    if max_width:
+        params["max_width"] = max_width
     return _call("take_screenshot", params)

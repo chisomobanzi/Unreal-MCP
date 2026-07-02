@@ -13,6 +13,8 @@
 #include "IAssetViewport.h"
 #include "IImageWrapper.h"
 #include "IImageWrapperModule.h"
+#include "ImageUtils.h"
+#include "RenderingThread.h"
 #include "Framework/Application/SlateApplication.h"
 
 
@@ -1194,6 +1196,16 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleTakeScreenshot(
 				TEXT("Failed to get viewport render target"));
 		}
 
+		// Force a fresh frame before reading pixels: scene mutations made via
+		// python/property writes since the last draw otherwise come back as a
+		// STALE image (render proxies not yet updated). Same pattern as
+		// screenshot_widget's double-draw + flush.
+		if (GEditor)
+		{
+			GEditor->RedrawLevelEditingViewports(/*bInvalidateHitProxies=*/true);
+		}
+		FlushRenderingCommands();
+
 		const FIntPoint Size = Viewport->GetSizeXY();
 		if (Size.X <= 0 || Size.Y <= 0)
 		{
@@ -1215,6 +1227,24 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleTakeScreenshot(
 	for (FColor& Pixel : Pixels)
 	{
 		Pixel.A = 255;
+	}
+
+	// Optional downscale: full viewport-size PNGs are an image-token cost for
+	// MCP clients reading the capture; max_width shrinks proportionally
+	// before encoding (e.g. 1280 is plenty for verify loops).
+	double MaxWidthD = 0.0;
+	if (Params->TryGetNumberField(TEXT("max_width"), MaxWidthD) &&
+		MaxWidthD >= 64.0 && Width > static_cast<int32>(MaxWidthD))
+	{
+		const int32 DstWidth = static_cast<int32>(MaxWidthD);
+		const int32 DstHeight = FMath::Max(
+			1, static_cast<int32>(static_cast<int64>(Height) * DstWidth / Width));
+		TArray<FColor> Resized;
+		FImageUtils::ImageResize(Width, Height, Pixels, DstWidth, DstHeight,
+			Resized, /*bLinearSpace=*/false, /*bForceOpaqueOutput=*/true);
+		Pixels = MoveTemp(Resized);
+		Width = DstWidth;
+		Height = DstHeight;
 	}
 
 	IImageWrapperModule& ImageWrapperModule =

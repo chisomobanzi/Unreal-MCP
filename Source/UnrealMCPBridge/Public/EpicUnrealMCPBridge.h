@@ -1,6 +1,9 @@
 #pragma once
 
+#include <atomic>
+
 #include "CoreMinimal.h"
+#include "Containers/Ticker.h"
 #include "EditorSubsystem.h"
 #include "Sockets.h"
 #include "SocketSubsystem.h"
@@ -69,6 +72,11 @@ private:
 	void WritePortFile() const;
 	void DeletePortFile() const;
 
+	// Editor readiness cache: written on the game thread (state ticker +
+	// on-demand before dispatch), readable from the socket thread for
+	// health_check. Guards against executing commands during editor boot.
+	void RefreshReadinessCache();
+
 	// Token debug: estimate tokens from a JSON result and optionally inject _debug field
 	void InjectTokenDebugInfo(
 		const FString& CommandType,
@@ -92,6 +100,19 @@ private:
 	// Token estimation debug mode
 	bool bDebugTokenEstimation;
 	TMap<FString, FMCPCommandTokenStats> TokenStats;
+
+	// Editor readiness snapshot (see RefreshReadinessCache)
+	std::atomic<bool> bCachedEditorReady{false};
+	mutable FCriticalSection ReadyStateCS;
+	FString CachedWorldName;
+	FString CachedNotReadyReason;
+	bool bCachedLoadingAssets = true;
+	bool bCachedPIEActive = false;
+
+	// Game-thread ticker: refreshes the readiness cache and re-asserts the
+	// port file if something (e.g. a cook wiping Saved/) deleted it.
+	FTSTicker::FDelegateHandle StateTickerHandle;
+	uint64 StateTickCount = 0;
 
 	// Command handler instances
 	TSharedPtr<FEpicUnrealMCPEditorCommands> EditorCommands;

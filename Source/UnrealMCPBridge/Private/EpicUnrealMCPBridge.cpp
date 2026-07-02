@@ -19,6 +19,10 @@
 #include "HAL/PlatformFileManager.h"
 #include "Misc/ConfigCacheIni.h"
 #include "Editor/EditorPerformanceSettings.h"
+#include "Editor.h"
+#include "AssetRegistry/IAssetRegistry.h"
+#include "HAL/FileManager.h"
+#include "Misc/ScopeLock.h"
 
 #define MCP_SERVER_HOST "127.0.0.1"
 #define MCP_DEFAULT_PORT 55557
@@ -208,10 +212,38 @@ void UEpicUnrealMCPBridge::StartServer()
 	bOriginalThrottleSetting = PerfSettings->bThrottleCPUWhenNotForeground;
 	PerfSettings->bThrottleCPUWhenNotForeground = false;
 	UE_LOG(LogTemp, Display, TEXT("UnrealMCP: Disabled background CPU throttling for responsive command execution"));
+
+	// Game-thread state ticker: keeps the readiness cache fresh for
+	// health_check, and re-asserts the port file every ~30s in case a
+	// cook/package run wiped Saved/UnrealMCP/ while the editor kept
+	// listening (which orphans the bridge from the MCP client).
+	StateTickCount = 0;
+	StateTickerHandle = FTSTicker::GetCoreTicker().AddTicker(
+		FTickerDelegate::CreateWeakLambda(this, [this](float) -> bool
+		{
+			RefreshReadinessCache();
+			if (++StateTickCount % 30 == 0 && bIsRunning)
+			{
+				const FString PortFilePath = FPaths::ProjectSavedDir() / TEXT("UnrealMCP") / TEXT("port.txt");
+				if (!IFileManager::Get().FileExists(*PortFilePath))
+				{
+					UE_LOG(LogTemp, Warning, TEXT("UnrealMCP: port file vanished (cook/cleanup?) — rewriting"));
+					WritePortFile();
+				}
+			}
+			return true;
+		}),
+		1.0f);
 }
 
 void UEpicUnrealMCPBridge::StopServer()
 {
+	if (StateTickerHandle.IsValid())
+	{
+		FTSTicker::GetCoreTicker().RemoveTicker(StateTickerHandle);
+		StateTickerHandle.Reset();
+	}
+
 	if (!bIsRunning)
 	{
 		return;
@@ -242,6 +274,53 @@ void UEpicUnrealMCPBridge::StopServer()
 	}
 
 	UE_LOG(LogTemp, Display, TEXT("UnrealMCP: Server stopped"));
+}
+
+void UEpicUnrealMCPBridge::RefreshReadinessCache()
+{
+	// Game-thread only: reads editor world state.
+	bool bReady = false;
+	bool bLoadingAssets = true;
+	bool bPIE = false;
+	FString WorldName;
+	FString Reason;
+
+	if (!GEditor)
+	{
+		Reason = TEXT("GEditor not available yet");
+	}
+	else
+	{
+		bPIE = GEditor->PlayWorld != nullptr;
+		UWorld* World = GEditor->GetEditorWorldContext().World();
+		if (!World)
+		{
+			Reason = TEXT("editor world not initialized yet");
+		}
+		else
+		{
+			WorldName = World->GetName();
+			IAssetRegistry* AssetRegistry = IAssetRegistry::Get();
+			bLoadingAssets = AssetRegistry ? AssetRegistry->IsLoadingAssets() : false;
+			if (bLoadingAssets)
+			{
+				Reason = TEXT("asset registry still scanning");
+			}
+			else
+			{
+				bReady = true;
+			}
+		}
+	}
+
+	{
+		FScopeLock Lock(&ReadyStateCS);
+		CachedWorldName = WorldName;
+		CachedNotReadyReason = Reason;
+		bCachedLoadingAssets = bLoadingAssets;
+		bCachedPIEActive = bPIE;
+	}
+	bCachedEditorReady.store(bReady, std::memory_order_relaxed);
 }
 
 void UEpicUnrealMCPBridge::WritePortFile() const
@@ -306,14 +385,17 @@ static TSharedPtr<FJsonObject> ExecutePythonCode(const FString& Code)
 		"_os, _oe = sys.stdout, sys.stderr\n"
 		"sys.stdout = _c\n"
 		"sys.stderr = _c\n"
-		"_gl = {'unreal': unreal, '__builtins__': __builtins__}\n"
-		"_lc = {}\n"
+		// Single namespace: with split globals/locals dicts, comprehensions and
+		// nested defs get their own scope and resolve free names via globals
+		// only — top-level user variables become invisible (NameError). One
+		// dict makes the code behave like true module scope.
+		"_ns = {'unreal': unreal, '__builtins__': __builtins__}\n"
 		"_mcp_out = ''\n"
 		"try:\n"
 		"    _code = base64.b64decode('%s').decode('utf-8')\n"
-		"    exec(_code, _gl, _lc)\n"
-		"    if 'result' in _lc:\n"
-		"        _r = _lc['result']\n"
+		"    exec(_code, _ns)\n"
+		"    if 'result' in _ns:\n"
+		"        _r = _ns['result']\n"
 		"        try:\n"
 		"            json.dumps(_r, default=str)\n"
 		"        except (TypeError, ValueError):\n"
@@ -477,6 +559,26 @@ FString UEpicUnrealMCPBridge::ExecuteCommand(
 		ResultJson->SetBoolField(TEXT("success"), true);
 		ResultJson->SetStringField(TEXT("status"), TEXT("ok"));
 		ResultJson->SetStringField(TEXT("editor"), TEXT("UnrealEngine5"));
+
+		// Editor readiness snapshot — from the game-thread-maintained cache
+		// (~1s fresh), so this stays answerable from the socket thread even
+		// while the game thread is busy. bridge-alive != editor-ready.
+		{
+			const bool bReady = bCachedEditorReady.load(std::memory_order_relaxed);
+			FScopeLock Lock(&ReadyStateCS);
+			ResultJson->SetBoolField(TEXT("ready"), bReady);
+			if (!bReady && !CachedNotReadyReason.IsEmpty())
+			{
+				ResultJson->SetStringField(TEXT("not_ready_reason"), CachedNotReadyReason);
+			}
+			if (!CachedWorldName.IsEmpty())
+			{
+				ResultJson->SetStringField(TEXT("world"), CachedWorldName);
+			}
+			ResultJson->SetBoolField(TEXT("is_loading_assets"), bCachedLoadingAssets);
+			ResultJson->SetBoolField(TEXT("pie_active"), bCachedPIEActive);
+		}
+
 		ResponseJson->SetObjectField(TEXT("result"), ResultJson);
 		return SerializeResponse(ResponseJson);
 	}
@@ -573,6 +675,32 @@ FString UEpicUnrealMCPBridge::ExecuteCommand(
 		[this, CommandType, Params, Promise = MoveTemp(Promise)]() mutable
 	{
 		TSharedPtr<FJsonObject> ResponseJson = MakeShareable(new FJsonObject);
+
+		// Readiness gate: executing commands during editor boot (world not up,
+		// asset registry mid-scan) has hard-crashed the editor (TickTaskManager
+		// assert on an early level load) and yields bogus empty query results.
+		// We're on the game thread here, so refresh the verdict now instead of
+		// trusting the ~1s-stale cache.
+		RefreshReadinessCache();
+		if (!bCachedEditorReady.load(std::memory_order_relaxed))
+		{
+			FString NotReadyReason;
+			{
+				FScopeLock Lock(&ReadyStateCS);
+				NotReadyReason = CachedNotReadyReason;
+			}
+			ResponseJson->SetStringField(TEXT("status"), TEXT("error"));
+			ResponseJson->SetStringField(TEXT("error"), FString::Printf(
+				TEXT("editor_not_ready: %s — retry shortly, or call wait_until_ready"),
+				*NotReadyReason));
+			ResponseJson->SetBoolField(TEXT("retryable"), true);
+
+			FString NotReadyString;
+			TSharedRef<TJsonWriter<>> NotReadyWriter = TJsonWriterFactory<>::Create(&NotReadyString);
+			FJsonSerializer::Serialize(ResponseJson.ToSharedRef(), NotReadyWriter);
+			Promise.SetValue(NotReadyString);
+			return;
+		}
 
 		// Run as an unattended script: editor code that would pop a modal
 		// dialog (on-save Data Validation slow-task, checkout prompts, etc.)

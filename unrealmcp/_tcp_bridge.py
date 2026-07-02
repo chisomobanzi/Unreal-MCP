@@ -12,6 +12,7 @@ to run simultaneously on different ports without configuration.
 All tool modules that need the C++ bridge import `_tcp_send` from here.
 """
 
+import glob
 import json
 import os
 import socket
@@ -30,7 +31,11 @@ TCP_HOST = "127.0.0.1"
 DEFAULT_PORT = 55557
 PORT_FILE = os.path.join("Saved", "UnrealMCP", "port.txt")
 CONNECT_TIMEOUT = 10  # seconds
-DEFAULT_RECV_TIMEOUT = 30  # seconds
+# Must EXCEED the C++ bridge's game-thread deadline (120s): the server always
+# answers by then (with its own timeout error if the command is still running),
+# so the client should wait it out rather than race it and retry a command
+# that is still executing.
+DEFAULT_RECV_TIMEOUT = 130  # seconds
 LARGE_OP_RECV_TIMEOUT = 300  # seconds
 BUFFER_SIZE = 65536  # 64 KB recv chunk size
 MAX_RETRIES = 3
@@ -41,12 +46,60 @@ LARGE_OPERATION_COMMANDS = {
     "read_blueprint_content",
     "analyze_blueprint_graph",
     "build_material_graph",
+    "build_material_function_graph",
     "performance_start_trace",
     "performance_analyze_insight",
     "add_widget",
     "set_widget_properties",
     "duplicate_widget",
+    "execute_python",
+    "save_all",
+    "save_asset",
+    "import_asset",
+    "import_assets_batch",
+    "compile_blueprint",
+    "compile_niagara_system",
+    "compile_statetree",
+    "take_screenshot",
+    "screenshot_widget",
 }
+
+
+class PostSendError(Exception):
+    """A failure that occurred AFTER the request was fully sent.
+
+    The editor may still be executing the command, so it must NOT be
+    retried — retrying would risk running a mutating command twice.
+    """
+
+
+def _find_project_root() -> Optional[str]:
+    """Locate the UE project root (the directory containing a .uproject).
+
+    Priority:
+        1. UNREAL_MCP_PROJECT_DIR environment variable
+        2. Walk up from the current working directory
+    """
+    env_dir = os.environ.get("UNREAL_MCP_PROJECT_DIR")
+    if env_dir and os.path.isdir(env_dir):
+        return env_dir
+
+    d = os.getcwd()
+    while True:
+        if glob.glob(os.path.join(d, "*.uproject")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+def _port_file_path() -> str:
+    """Absolute port-file path anchored to the project root (not the CWD)."""
+    root = _find_project_root()
+    if root:
+        return os.path.join(root, PORT_FILE)
+    return PORT_FILE  # legacy CWD-relative fallback
 
 
 def _resolve_port() -> int:
@@ -54,7 +107,7 @@ def _resolve_port() -> int:
 
     Priority:
         1. UNREAL_MCP_PORT environment variable (manual override)
-        2. Saved/UnrealMCP/port.txt (auto-written by running editor)
+        2. <project root>/Saved/UnrealMCP/port.txt (auto-written by the editor)
         3. Default 55557
     """
     env_port = os.environ.get("UNREAL_MCP_PORT")
@@ -67,18 +120,93 @@ def _resolve_port() -> int:
         except ValueError:
             logger.warning("Invalid UNREAL_MCP_PORT value: %s", env_port)
 
+    port_file = _port_file_path()
     try:
-        if os.path.exists(PORT_FILE):
-            with open(PORT_FILE, "r", encoding="utf-8") as f:
+        if os.path.exists(port_file):
+            with open(port_file, "r", encoding="utf-8") as f:
                 port = int(f.read().strip())
                 if 1 <= port <= 65535:
-                    logger.info("Using port %d from %s", port, PORT_FILE)
+                    logger.info("Using port %d from %s", port, port_file)
                     return port
     except (ValueError, OSError) as exc:
         logger.warning("Failed to read port file: %s", exc)
 
     logger.info("Using default port %d", DEFAULT_PORT)
     return DEFAULT_PORT
+
+
+def _latest_crash_dir(root: str) -> Optional[str]:
+    """Newest crashinfo-* directory under Saved/Crashes, if any."""
+    crashes = os.path.join(root, "Saved", "Crashes")
+    try:
+        dirs = [
+            os.path.join(crashes, d)
+            for d in os.listdir(crashes)
+            if d.startswith("crashinfo-")
+        ]
+    except OSError:
+        return None
+    if not dirs:
+        return None
+    return max(dirs, key=os.path.getmtime)
+
+
+def _crash_summary(crash_dir: str) -> str:
+    """First assertion/fatal line from a crash dir's log, if readable."""
+    markers = ("Assertion failed", "Fatal error", "SIGSEGV", "SIGILL", "SIGABRT")
+    try:
+        for name in os.listdir(crash_dir):
+            if not name.endswith(".log"):
+                continue
+            with open(
+                os.path.join(crash_dir, name),
+                "r", encoding="utf-8", errors="replace",
+            ) as f:
+                for line in f:
+                    if any(m in line for m in markers):
+                        return line.strip()[:300]
+    except OSError:
+        pass
+    return "(crash log unreadable)"
+
+
+def _diagnose_connection_failure(port: int) -> str:
+    """Turn a bare 'cannot connect' into an actionable message."""
+    base = f"Cannot connect to C++ bridge at {TCP_HOST}:{port}."
+    root = _find_project_root()
+    if root is None:
+        return (
+            f"{base} No .uproject found walking up from the CWD, so the "
+            "editor's port file cannot be located — start the MCP client "
+            "from inside the UE project, or set UNREAL_MCP_PROJECT_DIR."
+        )
+
+    port_file = os.path.join(root, PORT_FILE)
+    if not os.path.exists(port_file):
+        return (
+            f"{base} The editor is not running (no port file at "
+            f"{port_file}). Launch it (e.g. ./launch-editor.sh) and wait "
+            "for it to finish loading."
+        )
+
+    crash_dir = _latest_crash_dir(root)
+    try:
+        port_mtime = os.path.getmtime(port_file)
+    except OSError:
+        port_mtime = 0.0
+    if crash_dir and os.path.getmtime(crash_dir) >= port_mtime:
+        return (
+            f"{base} The editor appears to have CRASHED: "
+            f"{_crash_summary(crash_dir)} (see {crash_dir}). "
+            "Relaunch with ./launch-editor.sh."
+        )
+
+    return (
+        f"{base} A port file exists ({port_file}) but nothing is "
+        "listening — the editor may still be starting up or shutting "
+        "down, or the file is stale. If the editor is running, check "
+        "the UnrealMCP plugin output; otherwise relaunch it."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -128,20 +256,34 @@ class _TCPConnection:
             self._sock = None
 
     def _ensure_connected(self) -> bool:
-        """Connect only if not already connected. Reuses existing socket."""
+        """Connect only if not already connected. Reuses existing socket.
+
+        If the resolved port (usually from port.txt) refuses the connection,
+        probes the default port once — handles a stale port file left behind
+        by a crashed/previous editor instance.
+        """
         if self._sock is not None:
             return True
-        try:
-            self._sock = self._make_socket()
-            self._sock.connect((TCP_HOST, self._get_port()))
-            logger.info(
-                "Connected to C++ bridge at %s:%d",
-                TCP_HOST, self._get_port(),
-            )
-            return True
-        except Exception:
-            self._close_unsafe()
-            return False
+        port = self._get_port()
+        for candidate in (port, DEFAULT_PORT):
+            try:
+                self._sock = self._make_socket()
+                self._sock.connect((TCP_HOST, candidate))
+                if candidate != port:
+                    logger.warning(
+                        "Port %d (from port file) refused; connected on "
+                        "default %d — port file was stale", port, candidate,
+                    )
+                    self._port = candidate
+                logger.info(
+                    "Connected to C++ bridge at %s:%d", TCP_HOST, candidate,
+                )
+                return True
+            except Exception:
+                self._close_unsafe()
+                if candidate == DEFAULT_PORT:
+                    break
+        return False
 
     def _recv_exact(self, n: int) -> bytes:
         """Read exactly n bytes from the socket."""
@@ -190,11 +332,21 @@ class _TCPConnection:
         command: str,
         params: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Send a command to the C++ bridge and return the parsed response."""
+        """Send a command to the C++ bridge and return the parsed response.
+
+        Retries apply ONLY to failures that happen before the request was
+        fully sent (i.e. connection failures). Once the command has been
+        delivered, a lost/late response is NOT retried — the editor may
+        still be executing it, and a blind retry would double-execute
+        mutating commands (spawn/import/save/...).
+        """
         last_error = ""
         for attempt in range(MAX_RETRIES + 1):
             try:
                 return self._send_once(command, params)
+            except PostSendError as exc:
+                logger.error("TCP command %s: %s", command, exc)
+                return {"status": "error", "error": str(exc)}
             except (ConnectionError, TimeoutError, socket.error, OSError) as exc:
                 last_error = str(exc)
                 logger.warning(
@@ -215,7 +367,11 @@ class _TCPConnection:
 
         return {
             "status": "error",
-            "error": f"Failed after {MAX_RETRIES + 1} attempts: {last_error}",
+            "error": (
+                f"Failed after {MAX_RETRIES + 1} attempts: "
+                f"{_diagnose_connection_failure(self._get_port())} "
+                f"(last error: {last_error})"
+            ),
         }
 
     def _send_once(
@@ -229,6 +385,7 @@ class _TCPConnection:
                     f"Cannot connect to C++ bridge at "
                     f"{TCP_HOST}:{self._get_port()}"
                 )
+            sent = False
             try:
                 payload = json.dumps({
                     "type": command,
@@ -244,6 +401,7 @@ class _TCPConnection:
                 length_header = struct.pack(">I", len(payload_bytes))
                 self._sock.settimeout(10)
                 self._sock.sendall(length_header + payload_bytes)
+                sent = True
                 logger.info("Send complete, waiting for response...")
 
                 raw = self._recv_response(command)
@@ -271,6 +429,14 @@ class _TCPConnection:
             except Exception as exc:
                 logger.error("_send_once failed for %s: %s", command, exc)
                 self._close_unsafe()
+                if sent and not isinstance(exc, PostSendError):
+                    raise PostSendError(
+                        f"'{command}' was delivered to the editor but no "
+                        f"response arrived ({exc}). The editor may still be "
+                        "executing it — NOT retrying, to avoid double "
+                        "execution. Verify the editor state before "
+                        "re-issuing this command."
+                    ) from exc
                 raise
 
 

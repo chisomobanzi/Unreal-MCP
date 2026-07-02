@@ -16,6 +16,10 @@ def find_assets(
 ) -> str:
     """Search the Asset Registry by class, path, and/or name pattern.
 
+    name_pattern is a case-insensitive SUBSTRING match, not a glob —
+    "SpaceSky" matches M_SpaceSky; "*SpaceSky*" matches nothing (the *
+    is taken literally). A name-only search sweeps the whole /Game tree.
+
     Args:
         class_type: Shortcut ("material", "blueprint", "static_mesh", "texture",
             "data_table", "niagara_system", etc.) or "PackagePath.ClassName"
@@ -156,6 +160,7 @@ def import_asset(
     destination_path: str,
     destination_name: str = "",
     replace_existing: bool = True,
+    texture_options: dict | None = None,
 ) -> str:
     """Import an external file (texture, mesh, FBX, etc.) into the Content Browser.
 
@@ -164,6 +169,13 @@ def import_asset(
         destination_path: Content Browser path (e.g. "/Game/Textures")
         destination_name: Custom asset name (default: source filename without extension)
         replace_existing: Overwrite if asset already exists (default True)
+        texture_options: Optional settings applied to imported textures
+            (otherwise they land in the default World LOD group with
+            streaming on — wrong for skyboxes/UI). Keys:
+            lod_group ("TEXTUREGROUP_Skybox", "TEXTUREGROUP_UI", ...),
+            compression_settings ("TC_Default", "TC_HDR", ...),
+            mip_gen_settings ("TMGS_NoMipmaps", ...),
+            srgb (bool), never_stream (bool).
     """
     params = {
         "source_file":      source_file,
@@ -172,6 +184,8 @@ def import_asset(
     }
     if destination_name:
         params["destination_name"] = destination_name
+    if texture_options:
+        params["texture_options"] = texture_options
     return _call("import_asset", params)
 
 

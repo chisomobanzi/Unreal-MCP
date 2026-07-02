@@ -17,6 +17,8 @@
 #include "UObject/Field.h"
 #include "JsonObjectConverter.h"
 #include "Factories/Factory.h"
+#include "Engine/Texture.h"
+#include "Engine/TextureDefines.h"
 
 // Bypass the Interchange async pipeline which crashes when called from the
 // game-thread task graph (re-entrant ProcessTasksUntilIdle).
@@ -232,6 +234,16 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPAssetCommands::HandleFindAssets(
 		FARFilter Filter;
 		Filter.PackagePaths.Add(FName(*SearchPath));
 		Filter.bRecursivePaths = bRecursive;
+		AssetRegistry.GetAssets(Filter, AllAssets);
+	}
+	else if (!NamePattern.IsEmpty())
+	{
+		// Name-only search: sweep the whole /Game tree. Without this branch a
+		// bare name_pattern was matched against an EMPTY candidate set and
+		// always returned count:0 even for assets that exist.
+		FARFilter Filter;
+		Filter.PackagePaths.Add(FName(TEXT("/Game")));
+		Filter.bRecursivePaths = true;
 		AssetRegistry.GetAssets(Filter, AllAssets);
 	}
 
@@ -733,11 +745,44 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPAssetCommands::HandleSaveAsset(
 TSharedPtr<FJsonObject> FEpicUnrealMCPAssetCommands::HandleSaveAll(
 	const TSharedPtr<FJsonObject>& Params)
 {
+	// SaveDirtyPackages doesn't enumerate failures, so diff dirty-before vs
+	// dirty-after instead of hardcoding success — packages that fail or get
+	// skipped (e.g. a Blueprint that doesn't compile) stay dirty and were
+	// previously reported as saved.
+	TArray<UPackage*> DirtyBefore;
+	FEditorFileUtils::GetDirtyWorldPackages(DirtyBefore);
+	FEditorFileUtils::GetDirtyContentPackages(DirtyBefore);
+
 	FEditorFileUtils::SaveDirtyPackages(false, true, true);
 
+	TArray<UPackage*> DirtyAfter;
+	FEditorFileUtils::GetDirtyWorldPackages(DirtyAfter);
+	FEditorFileUtils::GetDirtyContentPackages(DirtyAfter);
+
+	TArray<TSharedPtr<FJsonValue>> FailedArray;
+	for (UPackage* Pkg : DirtyAfter)
+	{
+		if (Pkg)
+		{
+			FailedArray.Add(MakeShared<FJsonValueString>(Pkg->GetName()));
+		}
+	}
+
 	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
-	Result->SetBoolField(TEXT("success"), true);
-	Result->SetStringField(TEXT("message"), TEXT("All dirty assets saved"));
+	Result->SetBoolField(TEXT("success"), FailedArray.Num() == 0);
+	Result->SetNumberField(TEXT("saved_count"),
+		FMath::Max(0, DirtyBefore.Num() - DirtyAfter.Num()));
+	Result->SetArrayField(TEXT("failed_packages"), FailedArray);
+	if (FailedArray.Num() > 0)
+	{
+		Result->SetStringField(TEXT("error"), FString::Printf(
+			TEXT("%d package(s) failed to save or were skipped (still dirty) — commonly a Blueprint that doesn't compile"),
+			FailedArray.Num()));
+	}
+	else
+	{
+		Result->SetStringField(TEXT("message"), TEXT("All dirty assets saved"));
+	}
 	return Result;
 }
 
@@ -790,6 +835,67 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPAssetCommands::HandleImportAsset(
 	if (Factory)
 	{
 		Factory->RemoveFromRoot();
+	}
+
+	// Optional texture import settings. Without these, textures land in the
+	// default World LOD group with streaming on — wrong for skyboxes/UI — and
+	// UAssetImportTask offers no override path for simple image formats.
+	// Accepts: lod_group ("TEXTUREGROUP_Skybox"...), compression_settings
+	// ("TC_Default"...), mip_gen_settings ("TMGS_NoMipmaps"...),
+	// srgb (bool), never_stream (bool).
+	const TSharedPtr<FJsonObject>* TexOptions = nullptr;
+	if (Params->TryGetObjectField(TEXT("texture_options"), TexOptions) && TexOptions->IsValid())
+	{
+		for (UObject* ImportedObj : Task->GetObjects())
+		{
+			UTexture* Texture = Cast<UTexture>(ImportedObj);
+			if (!Texture)
+			{
+				continue;
+			}
+
+			FString EnumName;
+			if ((*TexOptions)->TryGetStringField(TEXT("lod_group"), EnumName))
+			{
+				const UEnum* Enum = StaticEnum<TextureGroup>();
+				const int64 Value = Enum ? Enum->GetValueByNameString(EnumName) : INDEX_NONE;
+				if (Value != INDEX_NONE)
+				{
+					Texture->LODGroup = static_cast<TextureGroup>(Value);
+				}
+			}
+			if ((*TexOptions)->TryGetStringField(TEXT("compression_settings"), EnumName))
+			{
+				const UEnum* Enum = StaticEnum<TextureCompressionSettings>();
+				const int64 Value = Enum ? Enum->GetValueByNameString(EnumName) : INDEX_NONE;
+				if (Value != INDEX_NONE)
+				{
+					Texture->CompressionSettings = static_cast<TextureCompressionSettings>(Value);
+				}
+			}
+			if ((*TexOptions)->TryGetStringField(TEXT("mip_gen_settings"), EnumName))
+			{
+				const UEnum* Enum = StaticEnum<TextureMipGenSettings>();
+				const int64 Value = Enum ? Enum->GetValueByNameString(EnumName) : INDEX_NONE;
+				if (Value != INDEX_NONE)
+				{
+					Texture->MipGenSettings = static_cast<TextureMipGenSettings>(Value);
+				}
+			}
+			bool bFlag = false;
+			if ((*TexOptions)->TryGetBoolField(TEXT("srgb"), bFlag))
+			{
+				Texture->SRGB = bFlag;
+			}
+			if ((*TexOptions)->TryGetBoolField(TEXT("never_stream"), bFlag))
+			{
+				Texture->NeverStream = bFlag;
+			}
+
+			Texture->PostEditChange();
+			Texture->MarkPackageDirty();
+			UEditorAssetLibrary::SaveAsset(Texture->GetPathName(), false);
+		}
 	}
 
 	TArray<TSharedPtr<FJsonValue>> ImportedArray;

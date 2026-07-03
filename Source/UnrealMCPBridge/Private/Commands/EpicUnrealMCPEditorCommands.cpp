@@ -100,6 +100,30 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleCommand(
 	{
 		return HandleTakeScreenshot(Params);
 	}
+	else if (CommandType == TEXT("start_pie"))
+	{
+		return HandleStartPIE(Params);
+	}
+	else if (CommandType == TEXT("stop_pie"))
+	{
+		return HandleStopPIE(Params);
+	}
+	else if (CommandType == TEXT("get_pie_status"))
+	{
+		return HandleGetPIEStatus(Params);
+	}
+	else if (CommandType == TEXT("set_viewport_camera"))
+	{
+		return HandleSetViewportCamera(Params);
+	}
+	else if (CommandType == TEXT("frame_actor"))
+	{
+		return HandleFrameActor(Params);
+	}
+	else if (CommandType == TEXT("execute_console_command"))
+	{
+		return HandleExecuteConsoleCommand(Params);
+	}
 
 	return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
 		FString::Printf(TEXT("Unknown editor command: %s"), *CommandType));
@@ -108,13 +132,32 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleCommand(
 TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleGetActorsInLevel(
 	const TSharedPtr<FJsonObject>& Params)
 {
+	// Editor world, not GWorld: GWorld is the PIE world during play.
 	TArray<AActor*> AllActors;
-	UGameplayStatics::GetAllActorsOfClass(GWorld, AActor::StaticClass(), AllActors);
+	UGameplayStatics::GetAllActorsOfClass(
+		FEpicUnrealMCPCommonUtils::GetEditorWorld(), AActor::StaticClass(), AllActors);
 
+	FString ClassFilter;
+	Params->TryGetStringField(TEXT("class_filter"), ClassFilter);
+	double MaxResultsD = 200.0;
+	Params->TryGetNumberField(TEXT("max_results"), MaxResultsD);
+	const int32 MaxResults = FMath::Max(1, (int32)MaxResultsD);
+
+	int32 Matched = 0;
 	TArray<TSharedPtr<FJsonValue>> ActorArray;
 	for (AActor* Actor : AllActors)
 	{
-		if (Actor)
+		if (!Actor)
+		{
+			continue;
+		}
+		if (!ClassFilter.IsEmpty() &&
+			!Actor->GetClass()->GetName().Contains(ClassFilter))
+		{
+			continue;
+		}
+		++Matched;
+		if (ActorArray.Num() < MaxResults)
 		{
 			ActorArray.Add(FEpicUnrealMCPCommonUtils::ActorToJson(Actor));
 		}
@@ -122,6 +165,13 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleGetActorsInLevel(
 
 	TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
 	ResultObj->SetArrayField(TEXT("actors"), ActorArray);
+	ResultObj->SetNumberField(TEXT("total_matched"), Matched);
+	if (Matched > ActorArray.Num())
+	{
+		ResultObj->SetStringField(TEXT("note"), FString::Printf(
+			TEXT("Showing %d of %d — raise max_results or narrow class_filter"),
+			ActorArray.Num(), Matched));
+	}
 	return ResultObj;
 }
 
@@ -134,20 +184,33 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleFindActorsByName(
 		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'pattern' parameter"));
 	}
 
+	// Editor world, not GWorld; match display labels as well as object names.
 	TArray<AActor*> AllActors;
-	UGameplayStatics::GetAllActorsOfClass(GWorld, AActor::StaticClass(), AllActors);
+	UGameplayStatics::GetAllActorsOfClass(
+		FEpicUnrealMCPCommonUtils::GetEditorWorld(), AActor::StaticClass(), AllActors);
 
+	double MaxResultsD = 100.0;
+	Params->TryGetNumberField(TEXT("max_results"), MaxResultsD);
+	const int32 MaxResults = FMath::Max(1, (int32)MaxResultsD);
+
+	int32 Matched = 0;
 	TArray<TSharedPtr<FJsonValue>> MatchingActors;
 	for (AActor* Actor : AllActors)
 	{
-		if (Actor && Actor->GetName().Contains(Pattern))
+		if (Actor && (Actor->GetName().Contains(Pattern) ||
+			Actor->GetActorLabel().Contains(Pattern)))
 		{
-			MatchingActors.Add(FEpicUnrealMCPCommonUtils::ActorToJson(Actor));
+			++Matched;
+			if (MatchingActors.Num() < MaxResults)
+			{
+				MatchingActors.Add(FEpicUnrealMCPCommonUtils::ActorToJson(Actor));
+			}
 		}
 	}
 
 	TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
 	ResultObj->SetArrayField(TEXT("actors"), MatchingActors);
+	ResultObj->SetNumberField(TEXT("total_matched"), Matched);
 	return ResultObj;
 }
 
@@ -330,23 +393,11 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleSetActorTransform(
 		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'name' parameter"));
 	}
 
-	AActor* TargetActor = nullptr;
-	TArray<AActor*> AllActors;
-	UGameplayStatics::GetAllActorsOfClass(GWorld, AActor::StaticClass(), AllActors);
-
-	for (AActor* Actor : AllActors)
-	{
-		if (Actor && Actor->GetName() == ActorName)
-		{
-			TargetActor = Actor;
-			break;
-		}
-	}
-
+	AActor* TargetActor = FEpicUnrealMCPCommonUtils::ResolveActor(ActorName);
 	if (!TargetActor)
 	{
 		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
-			FString::Printf(TEXT("Actor not found: %s"), *ActorName));
+			FString::Printf(TEXT("Actor not found (by label, name, or path): %s"), *ActorName));
 	}
 
 	FTransform NewTransform = TargetActor->GetTransform();
@@ -421,26 +472,51 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleGetWorldInfo(
 		UGameplayStatics::GetAllActorsOfClass(World, AActor::StaticClass(), AllActors);
 		Result->SetNumberField(TEXT("actor_count"), AllActors.Num());
 
-		const int32 ShowCount = FMath::Min(AllActors.Num(), 100);
+		FString ClassFilter;
+		Params->TryGetStringField(TEXT("class_filter"), ClassFilter);
+		bool bNamesOnly = false;
+		Params->TryGetBoolField(TEXT("names_only"), bNamesOnly);
+		double MaxActorsD = 100.0;
+		Params->TryGetNumberField(TEXT("max_actors"), MaxActorsD);
+		const int32 MaxActors = FMath::Max(0, (int32)MaxActorsD);
+
+		int32 Matched = 0;
 		TArray<TSharedPtr<FJsonValue>> ActorArray;
-		for (int32 i = 0; i < ShowCount; i++)
+		for (AActor* Actor : AllActors)
 		{
-			AActor* Actor = AllActors[i];
 			if (!Actor)
 			{
 				continue;
 			}
-			TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
-			Obj->SetStringField(TEXT("name"), Actor->GetName());
-			Obj->SetStringField(TEXT("class"), Actor->GetClass()->GetName());
-			ActorArray.Add(MakeShared<FJsonValueObject>(Obj));
+			if (!ClassFilter.IsEmpty() &&
+				!Actor->GetClass()->GetName().Contains(ClassFilter))
+			{
+				continue;
+			}
+			++Matched;
+			if (ActorArray.Num() >= MaxActors)
+			{
+				continue;
+			}
+			if (bNamesOnly)
+			{
+				ActorArray.Add(MakeShared<FJsonValueString>(Actor->GetActorLabel()));
+			}
+			else
+			{
+				TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+				Obj->SetStringField(TEXT("name"), Actor->GetName());
+				Obj->SetStringField(TEXT("class"), Actor->GetClass()->GetName());
+				ActorArray.Add(MakeShared<FJsonValueObject>(Obj));
+			}
 		}
 		Result->SetArrayField(TEXT("actors"), ActorArray);
 
-		if (AllActors.Num() > 100)
+		if (Matched > ActorArray.Num())
 		{
-			Result->SetStringField(TEXT("note"),
-				FString::Printf(TEXT("Showing 100 of %d actors"), AllActors.Num()));
+			Result->SetStringField(TEXT("note"), FString::Printf(
+				TEXT("Showing %d of %d matched — raise max_actors, use class_filter/names_only"),
+				ActorArray.Num(), Matched));
 		}
 	}
 
@@ -1271,5 +1347,179 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleTakeScreenshot(
 	Result->SetStringField(TEXT("file_path"), FPaths::ConvertRelativePathToFull(OutputPath));
 	Result->SetNumberField(TEXT("width"), Width);
 	Result->SetNumberField(TEXT("height"), Height);
+	return Result;
+}
+
+// ---------------------------------------------------------------------------
+// PIE control
+// ---------------------------------------------------------------------------
+
+TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleStartPIE(
+	const TSharedPtr<FJsonObject>& Params)
+{
+	if (!GEditor)
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("GEditor unavailable"));
+	}
+	if (GEditor->PlayWorld)
+	{
+		TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+		Result->SetBoolField(TEXT("success"), true);
+		Result->SetBoolField(TEXT("already_running"), true);
+		Result->SetStringField(TEXT("message"), TEXT("A PIE session is already running"));
+		return Result;
+	}
+
+	FRequestPlaySessionParams SessionParams;
+	// Simulate-in-editor keeps the editor camera instead of possessing a pawn.
+	bool bSimulate = false;
+	Params->TryGetBoolField(TEXT("simulate"), bSimulate);
+	if (bSimulate)
+	{
+		SessionParams.WorldType = EPlaySessionWorldType::SimulateInEditor;
+	}
+	GEditor->RequestPlaySession(SessionParams);
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetBoolField(TEXT("success"), true);
+	Result->SetBoolField(TEXT("requested"), true);
+	Result->SetStringField(TEXT("message"),
+		TEXT("PIE session requested — starts on the next editor tick; poll get_pie_status"));
+	return Result;
+}
+
+TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleStopPIE(
+	const TSharedPtr<FJsonObject>& Params)
+{
+	if (!GEditor)
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("GEditor unavailable"));
+	}
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	if (!GEditor->PlayWorld)
+	{
+		Result->SetBoolField(TEXT("success"), true);
+		Result->SetBoolField(TEXT("was_running"), false);
+		Result->SetStringField(TEXT("message"), TEXT("No PIE session was running"));
+		return Result;
+	}
+	GEditor->RequestEndPlayMap();
+	Result->SetBoolField(TEXT("success"), true);
+	Result->SetBoolField(TEXT("was_running"), true);
+	Result->SetStringField(TEXT("message"),
+		TEXT("PIE stop requested — ends on the next editor tick; poll get_pie_status"));
+	return Result;
+}
+
+TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleGetPIEStatus(
+	const TSharedPtr<FJsonObject>& Params)
+{
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	const bool bRunning = GEditor && GEditor->PlayWorld != nullptr;
+	Result->SetBoolField(TEXT("success"), true);
+	Result->SetBoolField(TEXT("pie_active"), bRunning);
+	if (bRunning)
+	{
+		Result->SetStringField(TEXT("play_world"), GEditor->PlayWorld->GetName());
+		Result->SetBoolField(TEXT("simulating"), GEditor->bIsSimulatingInEditor);
+	}
+	return Result;
+}
+
+// ---------------------------------------------------------------------------
+// Viewport control
+// ---------------------------------------------------------------------------
+
+TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleSetViewportCamera(
+	const TSharedPtr<FJsonObject>& Params)
+{
+	FLevelEditorViewportClient* Client = nullptr;
+	for (FLevelEditorViewportClient* Candidate : GEditor->GetLevelViewportClients())
+	{
+		if (Candidate && Candidate->IsPerspective())
+		{
+			Client = Candidate;
+			break;
+		}
+	}
+	if (!Client)
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("No perspective level viewport found"));
+	}
+
+	const FVector Location = FEpicUnrealMCPCommonUtils::GetVectorFromJson(Params, TEXT("location"));
+	Client->SetViewLocation(Location);
+
+	if (Params->HasField(TEXT("look_at")))
+	{
+		const FVector LookAt = FEpicUnrealMCPCommonUtils::GetVectorFromJson(Params, TEXT("look_at"));
+		Client->SetViewRotation((LookAt - Location).Rotation());
+	}
+	else if (Params->HasField(TEXT("rotation")))
+	{
+		Client->SetViewRotation(FEpicUnrealMCPCommonUtils::GetRotatorFromJson(Params, TEXT("rotation")));
+	}
+
+	Client->Invalidate();
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetBoolField(TEXT("success"), true);
+	Result->SetStringField(TEXT("location"), Client->GetViewLocation().ToString());
+	Result->SetStringField(TEXT("rotation"), Client->GetViewRotation().ToString());
+	return Result;
+}
+
+TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleFrameActor(
+	const TSharedPtr<FJsonObject>& Params)
+{
+	FString ActorRef;
+	if (!Params->TryGetStringField(TEXT("actor"), ActorRef) &&
+		!Params->TryGetStringField(TEXT("actor_label"), ActorRef) &&
+		!Params->TryGetStringField(TEXT("name"), ActorRef))
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'actor' parameter"));
+	}
+
+	AActor* Actor = FEpicUnrealMCPCommonUtils::ResolveActor(ActorRef);
+	if (!Actor)
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+			FString::Printf(TEXT("Actor not found (by label, name, or path): %s"), *ActorRef));
+	}
+
+	// Same as pressing F in the viewport — frames the actor's bounds.
+	GEditor->MoveViewportCamerasToActor(*Actor, /*bActiveViewportOnly=*/false);
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetBoolField(TEXT("success"), true);
+	Result->SetStringField(TEXT("framed"), Actor->GetActorLabel());
+	return Result;
+}
+
+// ---------------------------------------------------------------------------
+// Console
+// ---------------------------------------------------------------------------
+
+TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleExecuteConsoleCommand(
+	const TSharedPtr<FJsonObject>& Params)
+{
+	FString Command;
+	if (!Params->TryGetStringField(TEXT("command"), Command) || Command.IsEmpty())
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'command' parameter"));
+	}
+
+	UWorld* World = FEpicUnrealMCPCommonUtils::GetEditorWorld();
+	const bool bHandled = GEngine && GEngine->Exec(World, *Command);
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetBoolField(TEXT("success"), true);
+	Result->SetBoolField(TEXT("handled"), bHandled);
+	Result->SetStringField(TEXT("command"), Command);
+	if (!bHandled)
+	{
+		Result->SetStringField(TEXT("note"),
+			TEXT("Engine reported the command as unhandled — it may still have been consumed by a cvar sink"));
+	}
 	return Result;
 }

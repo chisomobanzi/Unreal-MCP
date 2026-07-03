@@ -7,9 +7,16 @@ from unrealmcp._tcp_bridge import _call
 
 
 @mcp.tool()
-def get_data_table_rows(data_table_path: str) -> str:
-    """Get all rows and their field data from a Data Table asset."""
-    return _call("get_data_table_rows", {"data_table_path": data_table_path})
+def get_data_table_rows(data_table_path: str, max_rows: int = 100) -> str:
+    """Get rows and their field data from a Data Table asset.
+
+    Returns at most max_rows rows (default 100) plus the total row_count;
+    use get_data_table_row for a specific row.
+    """
+    params: dict = {"data_table_path": data_table_path}
+    if max_rows != 100:
+        params["max_rows"] = max_rows
+    return _call("get_data_table_rows", params)
 
 
 @mcp.tool()

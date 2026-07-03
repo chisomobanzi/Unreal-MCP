@@ -32,4 +32,16 @@ private:
 	TSharedPtr<FJsonObject> HandleSpawnActorByClass(const TSharedPtr<FJsonObject>& Params);
 	TSharedPtr<FJsonObject> HandleFindActors(const TSharedPtr<FJsonObject>& Params);
 	TSharedPtr<FJsonObject> HandleTakeScreenshot(const TSharedPtr<FJsonObject>& Params);
+
+	// PIE control
+	TSharedPtr<FJsonObject> HandleStartPIE(const TSharedPtr<FJsonObject>& Params);
+	TSharedPtr<FJsonObject> HandleStopPIE(const TSharedPtr<FJsonObject>& Params);
+	TSharedPtr<FJsonObject> HandleGetPIEStatus(const TSharedPtr<FJsonObject>& Params);
+
+	// Viewport control
+	TSharedPtr<FJsonObject> HandleSetViewportCamera(const TSharedPtr<FJsonObject>& Params);
+	TSharedPtr<FJsonObject> HandleFrameActor(const TSharedPtr<FJsonObject>& Params);
+
+	// Console
+	TSharedPtr<FJsonObject> HandleExecuteConsoleCommand(const TSharedPtr<FJsonObject>& Params);
 };

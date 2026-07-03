@@ -15,6 +15,33 @@
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
+#include "Editor.h"
+#include "EngineUtils.h"
+
+UWorld* FEpicUnrealMCPCommonUtils::GetEditorWorld()
+{
+	return GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+}
+
+AActor* FEpicUnrealMCPCommonUtils::ResolveActor(const FString& ActorRef)
+{
+	UWorld* World = GetEditorWorld();
+	if (!World || ActorRef.IsEmpty())
+	{
+		return nullptr;
+	}
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		AActor* Actor = *It;
+		if (Actor && (Actor->GetActorLabel() == ActorRef ||
+			Actor->GetName() == ActorRef ||
+			Actor->GetPathName() == ActorRef))
+		{
+			return Actor;
+		}
+	}
+	return nullptr;
+}
 
 TSharedPtr<FJsonObject> FEpicUnrealMCPCommonUtils::CreateErrorResponse(const FString& Message)
 {

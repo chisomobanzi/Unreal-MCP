@@ -1,6 +1,6 @@
 # UnrealMCP — AI Bridge for Unreal Engine 5
 
-Control Unreal Engine 5 editor from AI coding assistants (Claude Code, Cursor, Windsurf, etc.). Create materials, blueprints, Niagara VFX, StateTrees, spawn actors, manage data tables, profile performance, and more — **280 commands** across 13 categories, all without leaving your terminal.
+Control Unreal Engine 5 editor from AI coding assistants (Claude Code, Cursor, Windsurf, etc.). Create materials, blueprints, Niagara VFX, StateTrees, spawn actors, manage data tables, profile performance, and more — **293 commands** across 13 categories, all without leaving your terminal.
 
 **Two ways to use it:**
 
@@ -55,7 +55,7 @@ pip install unrealmcp
                     │                                          │
                     │   C++ Plugin (UnrealMCPBridge)           │
                     │   TCP server on localhost:55557           │
-                    │   280 commands: materials, blueprints,   │
+                    │   293 commands: materials, blueprints,   │
                     │   niagara, statetree, actors, data       │
                     │   tables, profiling, and more            │
                     └──────────────┬───────────────────────────┘
@@ -72,7 +72,7 @@ pip install unrealmcp
           └───────────────────┘              └────────────────────┘
 ```
 
-The C++ plugin runs inside the editor and exposes 280 commands over TCP. The CLI and MCP server are two different front doors to the same plugin.
+The C++ plugin runs inside the editor and exposes 293 commands over TCP. The CLI and MCP server are two different front doors to the same plugin.
 
 ---
 
@@ -439,7 +439,7 @@ The script asks where to create the MCP config:
 
 ---
 
-## All 280 Commands
+## All 293 Commands
 
 | Category | Count | Highlights |
 |----------|------:|-----------|
@@ -923,7 +923,7 @@ Each editor picks a unique port automatically. The CLI and MCP server read the p
 Plugins/UnrealMCP/
 ├── UnrealMCP.uplugin              # Plugin manifest
 ├── cli/                            # Go CLI source (ue-cli)
-│   ├── cmd/                        # Command definitions (280 commands)
+│   ├── cmd/                        # Command definitions (293 commands)
 │   ├── internal/bridge/            # TCP client
 │   ├── internal/project/           # Plugin embedding & project detection
 │   └── npm/                        # npm package wrapper

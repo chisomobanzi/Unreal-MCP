@@ -126,10 +126,18 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPDataTableCommands::HandleGetDataTableRows(
 		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Data table has no row struct"));
 	}
 
+	double MaxRowsD = 100.0;
+	Params->TryGetNumberField(TEXT("max_rows"), MaxRowsD);
+	const int32 MaxRows = FMath::Max(1, (int32)MaxRowsD);
+
 	const TMap<FName, uint8*>& RowMap = DataTable->GetRowMap();
 	TArray<TSharedPtr<FJsonValue>> RowsArray;
 	for (auto& [RowName, RowData] : RowMap)
 	{
+		if (RowsArray.Num() >= MaxRows)
+		{
+			break;
+		}
 		RowsArray.Add(MakeShared<FJsonValueObject>(RowToJson(RowName, RowData, RowStruct)));
 	}
 
@@ -137,8 +145,14 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPDataTableCommands::HandleGetDataTableRows(
 	Result->SetBoolField(TEXT("success"), true);
 	Result->SetStringField(TEXT("path"), DataTablePath);
 	Result->SetStringField(TEXT("row_struct"), RowStruct->GetName());
-	Result->SetNumberField(TEXT("row_count"), RowsArray.Num());
+	Result->SetNumberField(TEXT("row_count"), RowMap.Num());
 	Result->SetArrayField(TEXT("rows"), RowsArray);
+	if (RowMap.Num() > RowsArray.Num())
+	{
+		Result->SetStringField(TEXT("note"), FString::Printf(
+			TEXT("Showing %d of %d rows — raise max_rows or use get_data_table_row"),
+			RowsArray.Num(), RowMap.Num()));
+	}
 	return Result;
 }
 

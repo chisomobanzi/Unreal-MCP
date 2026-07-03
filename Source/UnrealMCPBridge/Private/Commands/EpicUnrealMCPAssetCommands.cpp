@@ -297,6 +297,15 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPAssetCommands::HandleListAssets(
 
 	TArray<FString> AssetPaths = UEditorAssetLibrary::ListAssets(Path, bRecursive, false);
 
+	double MaxResultsD = 500.0;
+	Params->TryGetNumberField(TEXT("max_results"), MaxResultsD);
+	const int32 MaxResults = FMath::Max(1, (int32)MaxResultsD);
+	const int32 TotalFound = AssetPaths.Num();
+	if (AssetPaths.Num() > MaxResults)
+	{
+		AssetPaths.SetNum(MaxResults);
+	}
+
 	TArray<TSharedPtr<FJsonValue>> AssetArray;
 	for (const FString& AssetPath : AssetPaths)
 	{
@@ -304,8 +313,14 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPAssetCommands::HandleListAssets(
 	}
 
 	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
-	Result->SetNumberField(TEXT("count"), AssetPaths.Num());
+	Result->SetNumberField(TEXT("count"), TotalFound);
 	Result->SetArrayField(TEXT("assets"), AssetArray);
+	if (TotalFound > AssetArray.Num())
+	{
+		Result->SetStringField(TEXT("note"), FString::Printf(
+			TEXT("Showing %d of %d — raise max_results or narrow the path"),
+			AssetArray.Num(), TotalFound));
+	}
 	return Result;
 }
 

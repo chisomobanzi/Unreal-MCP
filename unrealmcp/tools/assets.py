@@ -42,17 +42,21 @@ def list_assets(
     path: str = "/Game",
     class_filter: str = "",
     recursive: bool = True,
+    max_results: int = 500,
 ) -> str:
     """List assets in a Content Browser directory.
 
     Args:
         path: Content path (e.g. "/Game", "/Game/Materials")
         class_filter: Optional class shortcut (e.g. "material", "blueprint")
+        max_results: Cap on returned entries (default 500); count reports
+            the true total.
     """
     return _call("list_assets", {
         "path":         path,
         "class_filter": class_filter,
         "recursive":    recursive,
+        "max_results":  max_results,
     })
 
 

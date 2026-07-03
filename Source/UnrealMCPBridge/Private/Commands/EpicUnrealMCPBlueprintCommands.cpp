@@ -932,23 +932,11 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPBlueprintCommands::HandleApplyMaterialToAc
 		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to get editor world"));
 	}
 
-	AActor* TargetActor = nullptr;
-	TArray<AActor*> AllActors;
-	UGameplayStatics::GetAllActorsOfClass(World, AActor::StaticClass(), AllActors);
-
-	for (AActor* Actor : AllActors)
-	{
-		if (Actor && Actor->GetName() == ActorName)
-		{
-			TargetActor = Actor;
-			break;
-		}
-	}
-
+	AActor* TargetActor = FEpicUnrealMCPCommonUtils::ResolveActor(ActorName);
 	if (!TargetActor)
 	{
 		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
-			FString::Printf(TEXT("Actor not found: %s"), *ActorName));
+			FString::Printf(TEXT("Actor not found (by label, name, or path): %s"), *ActorName));
 	}
 
 	UMaterialInterface* Material = Cast<UMaterialInterface>(UEditorAssetLibrary::LoadAsset(MaterialPath));
@@ -966,9 +954,16 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPBlueprintCommands::HandleApplyMaterialToAc
 	{
 		if (MeshComp)
 		{
+			MeshComp->Modify();
 			MeshComp->SetMaterial(MaterialSlot, Material);
 			bAppliedToAny = true;
 		}
+	}
+	if (bAppliedToAny)
+	{
+		// Undoable + saved: without this the change never dirtied the level.
+		TargetActor->Modify();
+		TargetActor->MarkPackageDirty();
 	}
 
 	if (!bAppliedToAny)

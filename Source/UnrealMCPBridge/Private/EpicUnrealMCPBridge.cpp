@@ -731,7 +731,13 @@ FString UEpicUnrealMCPBridge::ExecuteCommand(
 				CommandType == TEXT("get_actor_property_metadata") ||
 				CommandType == TEXT("spawn_actor_by_class") ||
 				CommandType == TEXT("find_actors") ||
-				CommandType == TEXT("take_screenshot"))
+				CommandType == TEXT("take_screenshot") ||
+				CommandType == TEXT("start_pie") ||
+				CommandType == TEXT("stop_pie") ||
+				CommandType == TEXT("get_pie_status") ||
+				CommandType == TEXT("set_viewport_camera") ||
+				CommandType == TEXT("frame_actor") ||
+				CommandType == TEXT("execute_console_command"))
 			{
 				ResultJson = EditorCommands->HandleCommand(CommandType, Params);
 			}

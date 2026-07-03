@@ -8,7 +8,11 @@ Or use directly in MCP configs:
     "command": "unrealmcp"
 """
 
-__version__ = "1.1.0"
+try:
+    from importlib.metadata import version as _pkg_version
+    __version__ = _pkg_version("unrealmcp")
+except Exception:  # not installed (running from a checkout)
+    __version__ = "0.0.0.dev0"
 
 
 def main():

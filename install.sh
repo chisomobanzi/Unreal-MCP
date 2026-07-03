@@ -24,15 +24,23 @@ fi
 echo " [OK] Python found: $($PYTHON --version)"
 echo ""
 
-# Install pip package
-echo " Installing unrealmcp Python package..."
-$PYTHON -m pip install unrealmcp -q 2>/dev/null || $PYTHON -m pip install --user unrealmcp -q 2>/dev/null || true
+# Install the LOCAL package into a venv next to this script (editable), so
+# the MCP server always matches this plugin's C++ bridge — a PyPI install can
+# lag the local command surface, and a venv avoids polluting the user python.
+PLUGIN_DIR="$(cd "$(dirname "$0")" && pwd)"
+VENV_DIR="$PLUGIN_DIR/.venv"
+echo " Installing unrealmcp (editable) into $VENV_DIR ..."
+if [ ! -d "$VENV_DIR" ]; then
+    $PYTHON -m venv "$VENV_DIR"
+fi
+"$VENV_DIR/bin/pip" install -q --upgrade pip
+"$VENV_DIR/bin/pip" install -q -e "$PLUGIN_DIR"
 
-if command -v unrealmcp &>/dev/null; then
-    echo " [OK] unrealmcp command ready"
+UNREALMCP_CMD="$VENV_DIR/bin/unrealmcp"
+if [ -x "$UNREALMCP_CMD" ]; then
+    echo " [OK] unrealmcp command ready: $UNREALMCP_CMD"
 else
-    echo " [ERROR] unrealmcp command not found after install."
-    echo "        You may need to add Python scripts to your PATH."
+    echo " [ERROR] $UNREALMCP_CMD not found after install."
     exit 1
 fi
 echo ""
@@ -122,7 +130,10 @@ with open(f) as fh:
     data = json.load(fh)
 if '$root_key' not in data:
     data['$root_key'] = {}
-entry = {'command': 'unrealmcp', 'args': [], 'env': {}}
+entry = {'command': '$UNREALMCP_CMD', 'args': [], 'env': {}}
+cwd = '$PROJECT_ROOT'
+if cwd:
+    entry['cwd'] = cwd
 ${extra}
 data['$root_key']['unreal'] = entry
 with open(f, 'w') as fh:
@@ -151,18 +162,30 @@ setup_claude() {
         merge_mcp_entry "$target" "mcpServers" "entry['type'] = 'stdio'"
         return
     fi
-    cat > "$target" << 'EOF'
+    if [ -n "$PROJECT_ROOT" ]; then
+        cat > "$target" << EOF
 {
   "mcpServers": {
     "unreal": {
       "type": "stdio",
-      "command": "unrealmcp",
-      "args": [],
-      "env": {}
+      "command": "$UNREALMCP_CMD",
+      "cwd": "$PROJECT_ROOT"
     }
   }
 }
 EOF
+    else
+        cat > "$target" << EOF
+{
+  "mcpServers": {
+    "unreal": {
+      "type": "stdio",
+      "command": "$UNREALMCP_CMD"
+    }
+  }
+}
+EOF
+    fi
     echo " [OK] Claude Code - $target"
 }
 

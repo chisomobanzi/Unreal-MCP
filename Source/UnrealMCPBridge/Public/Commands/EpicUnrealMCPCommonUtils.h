@@ -32,6 +32,15 @@ public:
 	static TSharedPtr<FJsonValue> ActorToJson(AActor* Actor);
 	static TSharedPtr<FJsonObject> ActorToJsonObject(AActor* Actor, bool bDetailed = false);
 
+	// The EDITOR world context. Never GWorld: during PIE, GWorld points at the
+	// play world, so commands using it silently operate on the wrong world.
+	static UWorld* GetEditorWorld();
+
+	// Resolve a level actor by display label, internal object name, or path
+	// name, on the editor world. Every actor-taking command should use this
+	// so label-vs-name behavior is consistent across the tool surface.
+	static AActor* ResolveActor(const FString& ActorRef);
+
 	// Blueprint
 	static UBlueprint* FindBlueprint(const FString& BlueprintName);
 	static UBlueprint* FindBlueprintByName(const FString& BlueprintName);

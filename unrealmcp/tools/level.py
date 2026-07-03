@@ -42,9 +42,25 @@ def get_selected_actors() -> str:
 
 
 @mcp.tool()
-def get_world_info() -> str:
-    """Get current editor level info (world name, actor count, actor list)."""
-    return _call("get_world_info")
+def get_world_info(
+    class_filter: str = "",
+    names_only: bool = False,
+    max_actors: int = 100,
+) -> str:
+    """Get current editor level info (world name, actor count, actor list).
+
+    The unfiltered listing costs ~1.8k tokens on a large level — prefer
+    class_filter (substring on class name) and/or names_only (labels only)
+    when you don't need the full dump.
+    """
+    params: dict = {}
+    if class_filter:
+        params["class_filter"] = class_filter
+    if names_only:
+        params["names_only"] = True
+    if max_actors != 100:
+        params["max_actors"] = max_actors
+    return _call("get_world_info", params)
 
 
 @mcp.tool()

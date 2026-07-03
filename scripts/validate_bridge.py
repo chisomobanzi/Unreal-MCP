@@ -5,14 +5,32 @@ Talks raw TCP to the C++ bridge (bypassing the MCP layer, which still runs
 the pre-upgrade Python in this session). Creates a scratch Blueprint,
 exercises every new/changed command, and cleans up.
 """
+import glob
 import json
+import os
 import socket
 import struct
 import sys
 import time
 
-PORT_FILE = "/home/chisomo-banzi/Developer/Speakeasy3D/UE-Project/Saved/UnrealMCP/port.txt"
-BP_DIR = "/Game/Dev"
+
+def _find_port_file() -> str:
+    """UNREAL_MCP_PROJECT_DIR, else walk up from CWD to the .uproject."""
+    env_dir = os.environ.get("UNREAL_MCP_PROJECT_DIR")
+    if env_dir:
+        return os.path.join(env_dir, "Saved", "UnrealMCP", "port.txt")
+    d = os.getcwd()
+    while True:
+        if glob.glob(os.path.join(d, "*.uproject")):
+            return os.path.join(d, "Saved", "UnrealMCP", "port.txt")
+        parent = os.path.dirname(d)
+        if parent == d:
+            return os.path.join("Saved", "UnrealMCP", "port.txt")
+        d = parent
+
+
+PORT_FILE = _find_port_file()
+BP_DIR = os.environ.get("UNREAL_MCP_VALIDATE_DIR", "/Game/Dev")
 BP_NAME = "BP_MCPValidation"
 BP_PATH = f"{BP_DIR}/{BP_NAME}"
 

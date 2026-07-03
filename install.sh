@@ -442,6 +442,14 @@ case "${TOOL_CHOICE:-0}" in
     0) echo " [SKIP] No config created" ;;
 esac
 
+# Install bundled workflow skills so Claude Code discovers them in this project.
+if [ "$SCOPE" = "PROJECT" ] && [ -n "$PROJECT_ROOT" ] && [ -d "$PLUGIN_DIR/skills" ]; then
+    mkdir -p "$PROJECT_ROOT/.claude/skills"
+    if cp -r "$PLUGIN_DIR/skills/"ue-mcp-* "$PROJECT_ROOT/.claude/skills/" 2>/dev/null; then
+        echo " [OK] Installed UnrealMCP workflow skills into .claude/skills/ (ue-mcp-*)"
+    fi
+fi
+
 echo ""
 echo " ============================================"
 echo "  Setup complete!"

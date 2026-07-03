@@ -15,6 +15,7 @@
 #include "IImageWrapperModule.h"
 #include "ImageUtils.h"
 #include "RenderingThread.h"
+#include "Camera/CameraComponent.h"
 #include "Framework/Application/SlateApplication.h"
 
 
@@ -123,6 +124,14 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleCommand(
 	else if (CommandType == TEXT("execute_console_command"))
 	{
 		return HandleExecuteConsoleCommand(Params);
+	}
+	else if (CommandType == TEXT("capture_from_camera"))
+	{
+		return HandleCaptureFromCamera(Params);
+	}
+	else if (CommandType == TEXT("contact_sheet"))
+	{
+		return HandleContactSheet(Params);
 	}
 
 	return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
@@ -1274,12 +1283,13 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleTakeScreenshot(
 
 		// Force a fresh frame before reading pixels: scene mutations made via
 		// python/property writes since the last draw otherwise come back as a
-		// STALE image (render proxies not yet updated). Same pattern as
-		// screenshot_widget's double-draw + flush.
+		// STALE image. Viewport->Draw() renders synchronously (a blocking command
+		// never ticks, so an invalidate-for-next-tick alone isn't enough).
 		if (GEditor)
 		{
 			GEditor->RedrawLevelEditingViewports(/*bInvalidateHitProxies=*/true);
 		}
+		Viewport->Draw();
 		FlushRenderingCommands();
 
 		const FIntPoint Size = Viewport->GetSizeXY();
@@ -1521,5 +1531,284 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleExecuteConsoleComman
 		Result->SetStringField(TEXT("note"),
 			TEXT("Engine reported the command as unhandled — it may still have been consumed by a cvar sink"));
 	}
+	return Result;
+}
+
+// ---------------------------------------------------------------------------
+// Shot capture — camera stills + contact sheets
+// ---------------------------------------------------------------------------
+
+namespace
+{
+	// The perspective viewport client we both AIM and CAPTURE (must be the same
+	// one — GetLevelViewportClients()[persp] and GetFirstActiveViewport() can be
+	// different viewports, which made every capture show the untouched view).
+	FLevelEditorViewportClient* MCP_GetCaptureClient()
+	{
+		if (!GEditor) return nullptr;
+		FViewport* Active = GEditor->GetActiveViewport();
+		FLevelEditorViewportClient* Fallback = nullptr;
+		for (FLevelEditorViewportClient* C : GEditor->GetLevelViewportClients())
+		{
+			if (C && C->IsPerspective() && C->Viewport)
+			{
+				if (C->Viewport == Active) return C;   // the one actually on screen
+				if (!Fallback) Fallback = C;
+			}
+		}
+		return Fallback;
+	}
+
+	// Render THIS client's viewport synchronously and read its pixels.
+	// WarmupFrames > 1 lets TSR/Lumen accumulate on a freshly-aimed view — a
+	// single Draw() of a just-moved camera is under-converged (dark/banded).
+	bool MCP_CaptureClient(FLevelEditorViewportClient* Client, int32 WarmupFrames,
+		TArray<FColor>& OutPixels, int32& OutW, int32& OutH, FString& OutErr)
+	{
+		if (!Client || !Client->Viewport) { OutErr = TEXT("Client has no viewport"); return false; }
+		FViewport* Viewport = Client->Viewport;
+
+		// Draw() renders SYNCHRONOUSLY (RedrawLevelEditingViewports only marks a
+		// redraw for a future tick, which never happens inside a blocking command).
+		const int32 Frames = FMath::Clamp(WarmupFrames, 1, 128);
+		for (int32 i = 0; i < Frames; ++i)
+		{
+			Client->Invalidate();
+			Viewport->Draw();
+		}
+		FlushRenderingCommands();
+
+		const FIntPoint Size = Viewport->GetSizeXY();
+		if (Size.X <= 0 || Size.Y <= 0) { OutErr = TEXT("Viewport has invalid size"); return false; }
+		if (!Viewport->ReadPixels(OutPixels)) { OutErr = TEXT("Failed to read pixels"); return false; }
+		OutW = Size.X; OutH = Size.Y;
+		for (FColor& Px : OutPixels) { Px.A = 255; }
+		return true;
+	}
+
+	bool MCP_SavePixelsPng(const TArray<FColor>& Pixels, int32 W, int32 H, const FString& Path, FString& OutErr)
+	{
+		IFileManager::Get().MakeDirectory(*FPaths::GetPath(Path), true);
+		IImageWrapperModule& Mod =
+			FModuleManager::LoadModuleChecked<IImageWrapperModule>(FName("ImageWrapper"));
+		TSharedPtr<IImageWrapper> Png = Mod.CreateImageWrapper(EImageFormat::PNG);
+		if (!Png.IsValid() ||
+			!Png->SetRaw(Pixels.GetData(), (int64)Pixels.Num() * sizeof(FColor), W, H, ERGBFormat::BGRA, 8))
+		{ OutErr = TEXT("Failed to encode PNG"); return false; }
+		if (!FFileHelper::SaveArrayToFile(Png->GetCompressed(), *Path))
+		{ OutErr = FString::Printf(TEXT("Failed to save: %s"), *Path); return false; }
+		return true;
+	}
+
+	// Point the viewport at a view spec: {camera:<ref>} OR {location, look_at|rotation, fov}.
+	// Returns a human label for the view. Empty return = failure (OutErr set).
+	FString MCP_AimViewport(FLevelEditorViewportClient* Client,
+		const TSharedPtr<FJsonObject>& View, FString& OutErr)
+	{
+		FString CamRef;
+		if (View->TryGetStringField(TEXT("camera"), CamRef) && !CamRef.IsEmpty())
+		{
+			AActor* CamActor = FEpicUnrealMCPCommonUtils::ResolveActor(CamRef);
+			if (!CamActor) { OutErr = FString::Printf(TEXT("Camera not found: %s"), *CamRef); return FString(); }
+			UCameraComponent* Cam = CamActor->FindComponentByClass<UCameraComponent>();
+			if (!Cam) { OutErr = FString::Printf(TEXT("No CameraComponent on %s"), *CamRef); return FString(); }
+			FMinimalViewInfo VI;
+			Cam->GetCameraView(0.0f, VI);
+			Client->SetViewLocation(VI.Location);
+			Client->SetViewRotation(VI.Rotation);
+			Client->ViewFOV = VI.FOV;
+			Client->FOVAngle = VI.FOV;
+			return CamActor->GetActorLabel();
+		}
+
+		if (!View->HasField(TEXT("location")))
+		{ OutErr = TEXT("View needs 'camera' or 'location'"); return FString(); }
+		const FVector Loc = FEpicUnrealMCPCommonUtils::GetVectorFromJson(View, TEXT("location"));
+		Client->SetViewLocation(Loc);
+		if (View->HasField(TEXT("look_at")))
+		{
+			const FVector LookAt = FEpicUnrealMCPCommonUtils::GetVectorFromJson(View, TEXT("look_at"));
+			Client->SetViewRotation((LookAt - Loc).Rotation());
+		}
+		else if (View->HasField(TEXT("rotation")))
+		{
+			Client->SetViewRotation(FEpicUnrealMCPCommonUtils::GetRotatorFromJson(View, TEXT("rotation")));
+		}
+		double Fov = 0.0;
+		if (View->TryGetNumberField(TEXT("fov"), Fov) && Fov > 1.0)
+		{
+			Client->ViewFOV = (float)Fov;
+			Client->FOVAngle = (float)Fov;
+		}
+		FString Label;
+		View->TryGetStringField(TEXT("label"), Label);
+		return Label.IsEmpty() ? TEXT("view") : Label;
+	}
+}
+
+TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleCaptureFromCamera(
+	const TSharedPtr<FJsonObject>& Params)
+{
+	FString CamRef;
+	if (!Params->TryGetStringField(TEXT("camera"), CamRef) &&
+		!Params->TryGetStringField(TEXT("camera_label"), CamRef) &&
+		!Params->TryGetStringField(TEXT("name"), CamRef))
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'camera' parameter"));
+	}
+
+	FLevelEditorViewportClient* Client = MCP_GetCaptureClient();
+	if (!Client) return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("No perspective level viewport"));
+
+	TSharedPtr<FJsonObject> View = MakeShared<FJsonObject>();
+	View->SetStringField(TEXT("camera"), CamRef);
+	FString Err;
+	const FString Label = MCP_AimViewport(Client, View, Err);
+	if (Label.IsEmpty()) return FEpicUnrealMCPCommonUtils::CreateErrorResponse(Err);
+
+	// Clean shot: game view (no gizmos/grid), restored afterwards.
+	bool bGameView = true;
+	Params->TryGetBoolField(TEXT("game_view"), bGameView);
+	const bool bWasGameView = Client->IsInGameView();
+	Client->SetGameView(bGameView);
+	Client->Invalidate();
+
+	TArray<FColor> Pixels; int32 W = 0, H = 0;
+	double WarmupD = 16.0;
+	Params->TryGetNumberField(TEXT("warmup_frames"), WarmupD);
+	const bool bOk = MCP_CaptureClient(Client, (int32)WarmupD, Pixels, W, H, Err);
+	Client->SetGameView(bWasGameView);
+	if (!bOk) return FEpicUnrealMCPCommonUtils::CreateErrorResponse(Err);
+
+	double MaxWidthD = 0.0;
+	if (Params->TryGetNumberField(TEXT("max_width"), MaxWidthD) && MaxWidthD >= 64.0 && W > (int32)MaxWidthD)
+	{
+		const int32 DstW = (int32)MaxWidthD;
+		const int32 DstH = FMath::Max(1, (int32)((int64)H * DstW / W));
+		TArray<FColor> Resized;
+		FImageUtils::ImageResize(W, H, Pixels, DstW, DstH, Resized, false, true);
+		Pixels = MoveTemp(Resized); W = DstW; H = DstH;
+	}
+
+	FString OutPath;
+	if (!Params->TryGetStringField(TEXT("file_path"), OutPath) || OutPath.IsEmpty())
+	{
+		OutPath = FPaths::ProjectSavedDir() / TEXT("Screenshots") /
+			FString::Printf(TEXT("Cam_%s.png"), *Label);
+	}
+	if (!MCP_SavePixelsPng(Pixels, W, H, OutPath, Err))
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(Err);
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetBoolField(TEXT("success"), true);
+	Result->SetStringField(TEXT("camera"), Label);
+	Result->SetStringField(TEXT("file_path"), FPaths::ConvertRelativePathToFull(OutPath));
+	Result->SetNumberField(TEXT("width"), W);
+	Result->SetNumberField(TEXT("height"), H);
+	return Result;
+}
+
+TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleContactSheet(
+	const TSharedPtr<FJsonObject>& Params)
+{
+	const TArray<TSharedPtr<FJsonValue>>* Views = nullptr;
+	if (!Params->TryGetArrayField(TEXT("views"), Views) || Views->Num() == 0)
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+			TEXT("Missing non-empty 'views' array (each: {camera:<ref>} or {location,look_at|rotation,fov,label})"));
+	}
+
+	FLevelEditorViewportClient* Client = MCP_GetCaptureClient();
+	if (!Client) return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("No perspective level viewport"));
+
+	int32 CellW = 480;
+	{ double d; if (Params->TryGetNumberField(TEXT("cell_width"), d)) CellW = FMath::Clamp((int32)d, 64, 1920); }
+
+	bool bGameView = true;
+	Params->TryGetBoolField(TEXT("game_view"), bGameView);
+	const bool bWasGameView = Client->IsInGameView();
+	Client->SetGameView(bGameView);
+
+	double WarmupD = 16.0;
+	Params->TryGetNumberField(TEXT("warmup_frames"), WarmupD);
+	const int32 WarmupFrames = (int32)WarmupD;
+
+	TArray<TArray<FColor>> Cells;
+	TArray<TSharedPtr<FJsonValue>> Labels;
+	int32 CellH = 0;
+	FString FirstErr;
+
+	for (const TSharedPtr<FJsonValue>& V : *Views)
+	{
+		const TSharedPtr<FJsonObject> View = V->AsObject();
+		if (!View.IsValid()) continue;
+
+		FString Err;
+		const FString Label = MCP_AimViewport(Client, View, Err);
+		if (Label.IsEmpty()) { if (FirstErr.IsEmpty()) FirstErr = Err; continue; }
+		Client->Invalidate();
+
+		TArray<FColor> Px; int32 W = 0, H = 0;
+		if (!MCP_CaptureClient(Client, WarmupFrames, Px, W, H, Err)) { if (FirstErr.IsEmpty()) FirstErr = Err; continue; }
+
+		if (CellH == 0) CellH = FMath::Max(1, (int32)((int64)CellW * H / W));
+		TArray<FColor> Cell;
+		FImageUtils::ImageResize(W, H, Px, CellW, CellH, Cell, false, true);
+		Cells.Add(MoveTemp(Cell));
+		Labels.Add(MakeShared<FJsonValueString>(Label));
+	}
+
+	Client->SetGameView(bWasGameView);
+
+	if (Cells.Num() == 0)
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+			FString::Printf(TEXT("No views captured. First error: %s"),
+				FirstErr.IsEmpty() ? TEXT("(none)") : *FirstErr));
+	}
+
+	const int32 N = Cells.Num();
+	int32 Cols = FMath::CeilToInt(FMath::Sqrt((float)N));
+	{ double d; if (Params->TryGetNumberField(TEXT("columns"), d) && d >= 1.0) Cols = (int32)d; }
+	Cols = FMath::Clamp(Cols, 1, N);
+	const int32 Rows = FMath::DivideAndRoundUp(N, Cols);
+
+	const int32 GridW = Cols * CellW;
+	const int32 GridH = Rows * CellH;
+	TArray<FColor> Grid;
+	Grid.Init(FColor(12, 12, 14, 255), GridW * GridH);
+
+	for (int32 i = 0; i < N; ++i)
+	{
+		const int32 r = i / Cols;
+		const int32 c = i % Cols;
+		const TArray<FColor>& Cell = Cells[i];
+		for (int32 y = 0; y < CellH; ++y)
+		{
+			const int32 SrcOffset = y * CellW;
+			const int32 DstOffset = (r * CellH + y) * GridW + c * CellW;
+			FMemory::Memcpy(&Grid[DstOffset], &Cell[SrcOffset], CellW * sizeof(FColor));
+		}
+	}
+
+	FString OutPath;
+	if (!Params->TryGetStringField(TEXT("file_path"), OutPath) || OutPath.IsEmpty())
+	{
+		OutPath = FPaths::ProjectSavedDir() / TEXT("Screenshots") / TEXT("ContactSheet.png");
+	}
+	FString Err;
+	if (!MCP_SavePixelsPng(Grid, GridW, GridH, OutPath, Err))
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(Err);
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetBoolField(TEXT("success"), true);
+	Result->SetStringField(TEXT("file_path"), FPaths::ConvertRelativePathToFull(OutPath));
+	Result->SetNumberField(TEXT("width"), GridW);
+	Result->SetNumberField(TEXT("height"), GridH);
+	Result->SetNumberField(TEXT("columns"), Cols);
+	Result->SetNumberField(TEXT("rows"), Rows);
+	Result->SetNumberField(TEXT("cell_width"), CellW);
+	Result->SetNumberField(TEXT("cell_height"), CellH);
+	Result->SetArrayField(TEXT("cells_row_major"), Labels);
 	return Result;
 }

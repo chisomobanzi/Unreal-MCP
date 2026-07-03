@@ -737,7 +737,9 @@ FString UEpicUnrealMCPBridge::ExecuteCommand(
 				CommandType == TEXT("get_pie_status") ||
 				CommandType == TEXT("set_viewport_camera") ||
 				CommandType == TEXT("frame_actor") ||
-				CommandType == TEXT("execute_console_command"))
+				CommandType == TEXT("execute_console_command") ||
+				CommandType == TEXT("capture_from_camera") ||
+				CommandType == TEXT("contact_sheet"))
 			{
 				ResultJson = EditorCommands->HandleCommand(CommandType, Params);
 			}

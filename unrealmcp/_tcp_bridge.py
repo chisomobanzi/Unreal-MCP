@@ -62,6 +62,8 @@ LARGE_OPERATION_COMMANDS = {
     "compile_statetree",
     "take_screenshot",
     "screenshot_widget",
+    "capture_from_camera",
+    "contact_sheet",
 }
 
 

@@ -1,19 +1,56 @@
 """
 Tool registration — importing each module registers its @mcp.tool() decorators.
-"""
 
-from unrealmcp.tools import core       # noqa: F401
-from unrealmcp.tools import assets     # noqa: F401
-from unrealmcp.tools import materials  # noqa: F401
-from unrealmcp.tools import blueprints # noqa: F401
-from unrealmcp.tools import level      # noqa: F401
-from unrealmcp.tools import data_tables # noqa: F401
-from unrealmcp.tools import blueprint_graph  # noqa: F401 — C++ bridge: BP graph nodes
-from unrealmcp.tools import editor_commands  # noqa: F401 — C++ bridge: actors, materials
-from unrealmcp.tools import data_assets      # noqa: F401 — C++ bridge: data asset CRUD
-from unrealmcp.tools import widgets          # noqa: F401 — C++ bridge: widget tree CRUD
-from unrealmcp.tools import enhanced_input   # noqa: F401 — C++ bridge: Enhanced Input IA/IMC
-from unrealmcp.tools import profiling        # noqa: F401 — C++ bridge: .utrace profiling analysis
-from unrealmcp.tools import debug            # noqa: F401 — C++ bridge: token debug & response analysis
-from unrealmcp.tools import niagara          # noqa: F401 — C++ bridge: Niagara particle system tools
-from unrealmcp.tools import statetree        # noqa: F401 — C++ bridge: StateTree AI asset tools
+By default every module loads (the full ~300-tool surface). Set the env var
+UNREAL_MCP_TOOLS to a comma-separated list of module names to load ONLY those
+(plus `core`, which is always loaded) — this shrinks the schema the MCP server
+advertises, useful for focused sessions on a harness without lazy tool loading.
+
+    UNREAL_MCP_TOOLS=materials,level,editor_commands   # look-dev session
+    UNREAL_MCP_TOOLS=niagara                            # VFX session
+
+Module names: assets, materials, blueprints, level, data_tables,
+blueprint_graph, editor_commands, data_assets, widgets, enhanced_input,
+profiling, debug, niagara, statetree.
+"""
+import importlib
+import logging
+import os
+
+logger = logging.getLogger("UnrealMCP.Tools")
+
+# Optional tool modules (core is always loaded — execute_python / health_check
+# / wait_until_ready are essential and must never be filtered out).
+_ALL_MODULES = [
+    "assets",
+    "materials",
+    "blueprints",
+    "level",
+    "data_tables",
+    "blueprint_graph",
+    "editor_commands",
+    "data_assets",
+    "widgets",
+    "enhanced_input",
+    "profiling",
+    "debug",
+    "niagara",
+    "statetree",
+]
+
+from unrealmcp.tools import core  # noqa: F401 — mandatory
+
+_selected = os.environ.get("UNREAL_MCP_TOOLS", "").strip()
+if _selected:
+    _wanted = {m.strip() for m in _selected.split(",") if m.strip()}
+    _unknown = _wanted - set(_ALL_MODULES)
+    if _unknown:
+        logger.warning("UNREAL_MCP_TOOLS: unknown module(s) ignored: %s", ", ".join(sorted(_unknown)))
+    _to_load = [m for m in _ALL_MODULES if m in _wanted]
+    logger.info("UNREAL_MCP_TOOLS set — loading %d/%d modules: %s",
+                len(_to_load), len(_ALL_MODULES), ", ".join(_to_load))
+else:
+    _to_load = _ALL_MODULES
+
+for _mod in _to_load:
+    importlib.import_module(f"unrealmcp.tools.{_mod}")

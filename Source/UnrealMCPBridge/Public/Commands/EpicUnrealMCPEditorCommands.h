@@ -44,4 +44,8 @@ private:
 
 	// Console
 	TSharedPtr<FJsonObject> HandleExecuteConsoleCommand(const TSharedPtr<FJsonObject>& Params);
+
+	// Shot capture
+	TSharedPtr<FJsonObject> HandleCaptureFromCamera(const TSharedPtr<FJsonObject>& Params);
+	TSharedPtr<FJsonObject> HandleContactSheet(const TSharedPtr<FJsonObject>& Params);
 };

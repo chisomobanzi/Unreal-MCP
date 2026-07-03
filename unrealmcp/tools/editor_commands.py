@@ -36,7 +36,7 @@ def find_actors_by_name(pattern: str, max_results: int = 100) -> str:
 
 
 @mcp.tool()
-def spawn_actor(
+def spawn_mesh_actor(
     name: str,
     actor_type: str = "StaticMeshActor",
     location: List[float] = None,
@@ -44,7 +44,11 @@ def spawn_actor(
     scale: List[float] = None,
     static_mesh: str = "",
 ) -> str:
-    """Spawn an actor in the level.
+    """Spawn a named actor with an optional static mesh + scale.
+
+    Complements spawn_actor (which spawns by class/BP path): this one names the
+    actor and can assign a StaticMesh + non-uniform scale. (Was a duplicate
+    'spawn_actor' that FastMCP silently dropped; renamed so both are reachable.)
 
     Args:
         name: Actor name
@@ -323,3 +327,64 @@ def execute_console_command(command: str) -> str:
     some cvar writes report unhandled but still apply via the cvar sink).
     """
     return _call("execute_console_command", {"command": command})
+
+
+# -- Shot capture -------------------------------------------------------------
+
+@mcp.tool()
+def capture_from_camera(
+    camera: str,
+    file_path: str = "",
+    game_view: bool = True,
+    max_width: int = 0,
+) -> str:
+    """Render a clean still from a camera actor's viewpoint.
+
+    Aims the level viewport at the camera actor (its transform + FOV, resolved
+    by label / name / path), captures, and restores the viewport. Great for
+    the authored CineCameras.
+
+    Args:
+        camera: Camera actor label / name / path (must have a CameraComponent).
+        file_path: Output PNG (default Saved/Screenshots/Cam_<label>.png).
+        game_view: Hide editor gizmos/grid for a clean shot (default True).
+        max_width: Optional proportional downscale before saving.
+    """
+    params: dict = {"camera": camera, "game_view": game_view}
+    if file_path:
+        params["file_path"] = file_path
+    if max_width:
+        params["max_width"] = max_width
+    return _call("capture_from_camera", params)
+
+
+@mcp.tool()
+def contact_sheet(
+    views: list[dict],
+    file_path: str = "",
+    columns: int = 0,
+    cell_width: int = 480,
+    game_view: bool = True,
+) -> str:
+    """Capture many views into one labeled grid PNG (look-dev / client review).
+
+    Each view is either a camera reference or an explicit framing:
+        {"camera": "CC_EngineRoom"}
+        {"location": [x,y,z], "look_at": [x,y,z], "fov": 60, "label": "hero"}
+        {"location": [x,y,z], "rotation": [pitch,yaw,roll], "label": "wide"}
+
+    Args:
+        views: List of view specs (see above).
+        file_path: Output PNG (default Saved/Screenshots/ContactSheet.png).
+        columns: Grid columns (default: near-square).
+        cell_width: Per-cell width in px (height follows the viewport aspect).
+        game_view: Hide editor gizmos/grid (default True).
+
+    The response's cells_row_major lists the captured labels in grid order.
+    """
+    params: dict = {"views": views, "cell_width": cell_width, "game_view": game_view}
+    if file_path:
+        params["file_path"] = file_path
+    if columns:
+        params["columns"] = columns
+    return _call("contact_sheet", params)

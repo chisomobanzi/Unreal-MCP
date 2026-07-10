@@ -101,6 +101,41 @@ def get_resource_stats() -> str:
 
 
 @mcp.tool()
+def get_editor_state() -> str:
+    """Classify the editor's state and the recommended recovery action.
+
+    States: running_ready / running_booting / hung_modal (a modal window is
+    up — engine tick blocked) / crashed (fresh crash dir or crash-handler
+    remnants) / not_running. Includes pids, port, crash summary, and a
+    `plan` field (none / unwedge_modal / rewrite_port_file / relaunch /
+    refuse-during-cook). Diagnostic only — nothing is touched.
+    """
+    from unrealmcp._watchdog import get_editor_state as _state
+    try:
+        return json.dumps(_state(), indent=2)
+    except Exception as exc:
+        return f"Error: {exc}"
+
+
+@mcp.tool()
+def recover_editor(wait_timeout_seconds: float = 600.0) -> str:
+    """Detect a crashed/hung/missing editor and recover it automatically.
+
+    Executes the planned action: dismiss a hung modal over the fast path,
+    rewrite a cook-deleted port.txt, or kill crash remnants (CrashReport
+    Client/apport) and relaunch via launch-editor.sh, waiting until the
+    bridge is ready. REFUSES to touch anything while a cook/UAT/package
+    process is running (shared editor guardrail). Returns a structured
+    crashed_recovered event with downtime and the crash assertion.
+    """
+    from unrealmcp._watchdog import recover_editor as _recover
+    try:
+        return json.dumps(_recover(wait_timeout_s=wait_timeout_seconds), indent=2)
+    except Exception as exc:
+        return f"Error: {exc}"
+
+
+@mcp.tool()
 def wait_until_ready(timeout_seconds: float = 600.0, poll_interval: float = 3.0) -> str:
     """Block until the editor is up AND ready for commands, or time out.
 

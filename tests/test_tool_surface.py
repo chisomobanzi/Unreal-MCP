@@ -34,5 +34,7 @@ def test_manifest_lists_every_tool():
 
 def test_essential_tools_present():
     for name in ("execute_python", "health_check", "wait_until_ready",
-                 "take_screenshot", "contact_sheet"):
+                 "take_screenshot", "contact_sheet",
+                 # reliability layer (playtest harness phase 1)
+                 "set_unattended_mode", "get_bridge_events", "get_resource_stats"):
         assert name in mcp._tool_manager._tools, f"essential tool {name} not registered"

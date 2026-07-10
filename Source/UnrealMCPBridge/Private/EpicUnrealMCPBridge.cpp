@@ -23,6 +23,8 @@
 #include "AssetRegistry/IAssetRegistry.h"
 #include "HAL/FileManager.h"
 #include "Misc/ScopeLock.h"
+#include "Framework/Application/SlateApplication.h"
+#include "Widgets/SWindow.h"
 
 #define MCP_SERVER_HOST "127.0.0.1"
 #define MCP_DEFAULT_PORT 55557
@@ -72,6 +74,13 @@ void UEpicUnrealMCPBridge::Initialize(FSubsystemCollectionBase& Collection)
 		ConfigPort = MCP_DEFAULT_PORT;
 	}
 	Port = static_cast<uint16>(ConfigPort);
+
+	// Optional default-on non-interactive mode from [UnrealMCP] UnattendedMode.
+	// Off by default: the editor is usually shared with a human doing manual
+	// work, and unattended mode silently takes dialogs' default answers.
+	bool bConfigUnattended = false;
+	GConfig->GetBool(TEXT("UnrealMCP"), TEXT("UnattendedMode"), bConfigUnattended, GEngineIni);
+	bUnattendedMode.store(bConfigUnattended, std::memory_order_relaxed);
 
 	// Read optional debug token estimation flag from [UnrealMCP] DebugTokens
 	GConfig->GetBool(TEXT("UnrealMCP"), TEXT("DebugTokens"), bDebugTokenEstimation, GEngineIni);
@@ -234,6 +243,133 @@ void UEpicUnrealMCPBridge::StartServer()
 			return true;
 		}),
 		1.0f);
+
+	// Modal sentinel + persistent-unattended re-assert. OnPreTick (unlike the
+	// core ticker above) still fires while a modal window pumps Slate, so this
+	// can dismiss dialogs that would otherwise hang every queued command to
+	// serial 120s timeouts (e.g. the BP-compile-error prompt PIE raises one
+	// tick AFTER start_pie's own unattended guard has expired).
+	if (FSlateApplication::IsInitialized())
+	{
+		SlatePreTickHandle = FSlateApplication::Get().OnPreTick().AddUObject(
+			this, &UEpicUnrealMCPBridge::OnSlatePreTick);
+	}
+}
+
+void UEpicUnrealMCPBridge::OnSlatePreTick(float /*DeltaTime*/)
+{
+	const bool bUnattended = bUnattendedMode.load(std::memory_order_relaxed);
+
+	// Persistent mode must survive engine code that flips the global back
+	// (command handlers' TGuardValue, dialogs' own scopes), so re-assert it
+	// every Slate tick rather than setting it once.
+	if (bUnattended)
+	{
+		GIsRunningUnattendedScript = true;
+		if (!bAppliedUnattended)
+		{
+			bAppliedUnattended = true;
+			UnattendedEnableTime = FPlatformTime::Seconds();
+		}
+	}
+	else if (bAppliedUnattended)
+	{
+		GIsRunningUnattendedScript = false;
+		bAppliedUnattended = false;
+	}
+
+	if (!FSlateApplication::IsInitialized())
+	{
+		return;
+	}
+
+	// Track the active modal's first-seen time regardless of mode — a modal
+	// that opened while attended is what the recovery path must recognize.
+	TSharedPtr<SWindow> Modal = FSlateApplication::Get().GetActiveModalWindow();
+	if (!Modal.IsValid())
+	{
+		LastObservedModal.Reset();
+		if (bModalActive.load(std::memory_order_relaxed))
+		{
+			bModalActive.store(false, std::memory_order_relaxed);
+			FScopeLock Lock(&EventsCS);
+			CachedModalTitle.Empty();
+		}
+		return;
+	}
+	if (!LastObservedModal.HasSameObject(Modal.Get()))
+	{
+		LastObservedModal = Modal;
+		ModalFirstSeenTime = FPlatformTime::Seconds();
+		bModalPresenceRecorded = false;
+		{
+			FScopeLock Lock(&EventsCS);
+			CachedModalTitle = Modal->GetTitle().ToString();
+		}
+		bModalActive.store(true, std::memory_order_relaxed);
+	}
+
+	if (!bUnattended || !bDismissModals.load(std::memory_order_relaxed))
+	{
+		return;
+	}
+
+	const FString Title = Modal->GetTitle().ToString();
+
+	if (ModalFirstSeenTime >= UnattendedEnableTime)
+	{
+		// Appeared while unattended mode was already on. Slate cancels all
+		// non-slow-task modals in that state (SlateApplication.cpp
+		// AddModalWindow), so this is a slow-task progress window doing
+		// legitimate work — dismissing it aborts the operation (it broke
+		// load_level once). Record its presence and leave it alone.
+		if (!bModalPresenceRecorded)
+		{
+			bModalPresenceRecorded = true;
+			TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+			Payload->SetStringField(TEXT("title"), Title);
+			AddBridgeEvent(TEXT("modal_present"), Payload);
+		}
+		return;
+	}
+
+	if (bModalPresenceRecorded)
+	{
+		// Already asked this window to close; destruction can take a tick.
+		return;
+	}
+	bModalPresenceRecorded = true;
+
+	UE_LOG(LogTemp, Warning,
+		TEXT("UnrealMCP: unattended recovery — dismissing pre-existing modal '%s' (default/cancel result)"),
+		*Title);
+
+	TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetStringField(TEXT("title"), Title);
+	AddBridgeEvent(TEXT("modal_dismissed"), Payload);
+
+	// Closing the window ends the modal loop; the dialog's caller receives
+	// its default/cancel result — the safe non-interactive answer.
+	Modal->RequestDestroyWindow();
+}
+
+void UEpicUnrealMCPBridge::AddBridgeEvent(const FString& EventType, TSharedPtr<FJsonObject> Payload)
+{
+	TSharedPtr<FJsonObject> Event = MakeShared<FJsonObject>();
+	FScopeLock Lock(&EventsCS);
+	Event->SetNumberField(TEXT("seq"), static_cast<double>(++EventSeq));
+	Event->SetStringField(TEXT("time"), FDateTime::UtcNow().ToIso8601());
+	Event->SetStringField(TEXT("type"), EventType);
+	if (Payload.IsValid())
+	{
+		Event->SetObjectField(TEXT("data"), Payload);
+	}
+	BridgeEvents.Add(Event);
+	constexpr int32 MaxEvents = 256;
+	if (BridgeEvents.Num() > MaxEvents)
+	{
+		BridgeEvents.RemoveAt(0, BridgeEvents.Num() - MaxEvents);
+	}
 }
 
 void UEpicUnrealMCPBridge::StopServer()
@@ -242,6 +378,17 @@ void UEpicUnrealMCPBridge::StopServer()
 	{
 		FTSTicker::GetCoreTicker().RemoveTicker(StateTickerHandle);
 		StateTickerHandle.Reset();
+	}
+
+	if (SlatePreTickHandle.IsValid() && FSlateApplication::IsInitialized())
+	{
+		FSlateApplication::Get().OnPreTick().Remove(SlatePreTickHandle);
+		SlatePreTickHandle.Reset();
+	}
+	if (bAppliedUnattended)
+	{
+		GIsRunningUnattendedScript = false;
+		bAppliedUnattended = false;
 	}
 
 	if (!bIsRunning)
@@ -579,6 +726,111 @@ FString UEpicUnrealMCPBridge::ExecuteCommand(
 			ResultJson->SetBoolField(TEXT("pie_active"), bCachedPIEActive);
 		}
 
+		ResultJson->SetBoolField(TEXT("unattended_mode"),
+			bUnattendedMode.load(std::memory_order_relaxed));
+		ResultJson->SetBoolField(TEXT("modal_active"),
+			bModalActive.load(std::memory_order_relaxed));
+		{
+			FScopeLock Lock(&EventsCS);
+			if (!CachedModalTitle.IsEmpty())
+			{
+				ResultJson->SetStringField(TEXT("modal_title"), CachedModalTitle);
+			}
+			ResultJson->SetNumberField(TEXT("pending_events"), BridgeEvents.Num());
+		}
+
+		ResponseJson->SetObjectField(TEXT("result"), ResultJson);
+		return SerializeResponse(ResponseJson);
+	}
+
+	// Toggle persistent non-interactive mode (unattended + modal auto-dismiss).
+	// Fast-path so it works even while the game thread is blocked by a modal —
+	// enabling it mid-hang lets the sentinel dismiss the offending dialog.
+	if (CommandType == TEXT("set_unattended_mode"))
+	{
+		bool bEnable = true;
+		if (Params.IsValid() && Params->HasField(TEXT("enabled")))
+		{
+			bEnable = Params->GetBoolField(TEXT("enabled"));
+		}
+		bool bDismiss = true;
+		if (Params.IsValid() && Params->HasField(TEXT("dismiss_modals")))
+		{
+			bDismiss = Params->GetBoolField(TEXT("dismiss_modals"));
+		}
+
+		bUnattendedMode.store(bEnable, std::memory_order_relaxed);
+		bDismissModals.store(bDismiss, std::memory_order_relaxed);
+		if (!bEnable)
+		{
+			// Take effect immediately, not on the next Slate tick: code that
+			// runs later this same frame (deferred tasks) must already see
+			// attended behavior. Benign unsynchronized bool write; the
+			// pre-tick transition remains as the tidy-up path.
+			GIsRunningUnattendedScript = false;
+		}
+
+		TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+		Payload->SetBoolField(TEXT("enabled"), bEnable);
+		Payload->SetBoolField(TEXT("dismiss_modals"), bDismiss);
+		AddBridgeEvent(TEXT("unattended_mode_changed"), Payload);
+
+		UE_LOG(LogTemp, Display, TEXT("UnrealMCP: unattended mode %s (dismiss_modals=%s)"),
+			bEnable ? TEXT("ENABLED") : TEXT("DISABLED"),
+			bDismiss ? TEXT("true") : TEXT("false"));
+
+		TSharedPtr<FJsonObject> ResponseJson = MakeShareable(new FJsonObject);
+		ResponseJson->SetStringField(TEXT("status"), TEXT("success"));
+		TSharedPtr<FJsonObject> ResultJson = MakeShareable(new FJsonObject);
+		ResultJson->SetBoolField(TEXT("success"), true);
+		ResultJson->SetBoolField(TEXT("unattended_mode"), bEnable);
+		ResultJson->SetBoolField(TEXT("dismiss_modals"), bDismiss);
+		ResponseJson->SetObjectField(TEXT("result"), ResultJson);
+		return SerializeResponse(ResponseJson);
+	}
+
+	// Drain the bridge event ring buffer. Fast-path deliberately: events must
+	// be readable while the game thread is hung (that's when you need them).
+	if (CommandType == TEXT("get_bridge_events"))
+	{
+		uint64 Since = 0;
+		if (Params.IsValid() && Params->HasField(TEXT("since")))
+		{
+			Since = static_cast<uint64>(FMath::Max(0.0, Params->GetNumberField(TEXT("since"))));
+		}
+		bool bClear = false;
+		if (Params.IsValid() && Params->HasField(TEXT("clear")))
+		{
+			bClear = Params->GetBoolField(TEXT("clear"));
+		}
+
+		TArray<TSharedPtr<FJsonValue>> EventsArr;
+		uint64 LastSeq = 0;
+		{
+			FScopeLock Lock(&EventsCS);
+			for (const TSharedPtr<FJsonObject>& Event : BridgeEvents)
+			{
+				const uint64 Seq = static_cast<uint64>(Event->GetNumberField(TEXT("seq")));
+				if (Seq > Since)
+				{
+					EventsArr.Add(MakeShared<FJsonValueObject>(Event));
+				}
+			}
+			LastSeq = EventSeq;
+			if (bClear)
+			{
+				BridgeEvents.Empty();
+			}
+		}
+
+		TSharedPtr<FJsonObject> ResponseJson = MakeShareable(new FJsonObject);
+		ResponseJson->SetStringField(TEXT("status"), TEXT("success"));
+		TSharedPtr<FJsonObject> ResultJson = MakeShareable(new FJsonObject);
+		ResultJson->SetBoolField(TEXT("success"), true);
+		ResultJson->SetArrayField(TEXT("events"), EventsArr);
+		ResultJson->SetNumberField(TEXT("last_seq"), static_cast<double>(LastSeq));
+		ResultJson->SetBoolField(TEXT("unattended_mode"),
+			bUnattendedMode.load(std::memory_order_relaxed));
 		ResponseJson->SetObjectField(TEXT("result"), ResultJson);
 		return SerializeResponse(ResponseJson);
 	}
@@ -667,7 +919,49 @@ FString UEpicUnrealMCPBridge::ExecuteCommand(
 		return SerializeResponse(ResponseJson);
 	}
 
-	// All other commands require the game thread for UObject/Editor API access
+	// All other commands require the game thread for UObject/Editor API access.
+	// Kept for callers that want synchronous semantics; the socket loop uses
+	// DispatchCommandAsync directly so it can keep servicing fast-path
+	// commands while a game-thread command is in flight.
+	TFuture<FString> Future = DispatchCommandAsync(CommandType, Params);
+
+	// Wait with a timeout to prevent permanently blocking the caller
+	// if the game thread hangs or crashes before setting the Promise.
+	constexpr double TimeoutSeconds = 120.0;
+	if (!Future.WaitFor(FTimespan::FromSeconds(TimeoutSeconds)))
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("UnrealMCP: Command '%s' timed out after %.0fs waiting for game thread"),
+			*CommandType, TimeoutSeconds);
+
+		TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+		Payload->SetStringField(TEXT("command"), CommandType);
+		Payload->SetNumberField(TEXT("timeout_seconds"), TimeoutSeconds);
+		AddBridgeEvent(TEXT("command_timeout"), Payload);
+
+		return TEXT("{\"status\":\"error\",\"error\":\"Command timed out waiting for game thread\"}");
+	}
+
+	return Future.Get();
+}
+
+bool UEpicUnrealMCPBridge::IsFastPathCommand(const FString& CommandType) const
+{
+	// Must exactly match the set handled before the game-thread dispatch in
+	// ExecuteCommand. These answer from the socket thread even while the game
+	// thread is hung.
+	return CommandType == TEXT("ping")
+		|| CommandType == TEXT("health_check")
+		|| CommandType == TEXT("set_unattended_mode")
+		|| CommandType == TEXT("get_bridge_events")
+		|| CommandType == TEXT("set_mcp_debug")
+		|| CommandType == TEXT("get_mcp_token_stats");
+}
+
+TFuture<FString> UEpicUnrealMCPBridge::DispatchCommandAsync(
+	const FString& CommandType,
+	const TSharedPtr<FJsonObject>& Params)
+{
 	TPromise<FString> Promise;
 	TFuture<FString> Future = Promise.GetFuture();
 
@@ -739,7 +1033,9 @@ FString UEpicUnrealMCPBridge::ExecuteCommand(
 				CommandType == TEXT("frame_actor") ||
 				CommandType == TEXT("execute_console_command") ||
 				CommandType == TEXT("capture_from_camera") ||
-				CommandType == TEXT("contact_sheet"))
+				CommandType == TEXT("contact_sheet") ||
+				CommandType == TEXT("get_resource_stats") ||
+				CommandType == TEXT("debug_open_modal"))
 			{
 				ResultJson = EditorCommands->HandleCommand(CommandType, Params);
 			}
@@ -966,16 +1262,5 @@ FString UEpicUnrealMCPBridge::ExecuteCommand(
 		Promise.SetValue(ResultString);
 	});
 
-	// Wait with a timeout to prevent permanently blocking the server thread
-	// if the game thread hangs or crashes before setting the Promise.
-	constexpr double TimeoutSeconds = 120.0;
-	if (!Future.WaitFor(FTimespan::FromSeconds(TimeoutSeconds)))
-	{
-		UE_LOG(LogTemp, Error,
-			TEXT("UnrealMCP: Command '%s' timed out after %.0fs waiting for game thread"),
-			*CommandType, TimeoutSeconds);
-		return TEXT("{\"status\":\"error\",\"error\":\"Command timed out waiting for game thread\"}");
-	}
-
-	return Future.Get();
+	return Future;
 }

@@ -3,6 +3,7 @@
 #include <atomic>
 
 #include "CoreMinimal.h"
+#include "Async/Future.h"
 #include "Containers/Ticker.h"
 #include "EditorSubsystem.h"
 #include "Sockets.h"
@@ -23,6 +24,7 @@
 #include "EpicUnrealMCPBridge.generated.h"
 
 class FMCPServerRunnable;
+class SWindow;
 
 /**
  * Per-command token usage statistics, accumulated while debug mode is active.
@@ -61,13 +63,34 @@ public:
 	void StopServer();
 	bool IsRunning() const { return bIsRunning; }
 
-	// Command execution
+	// Command execution (synchronous: fast path answers inline, game-thread
+	// commands block up to 120s)
 	FString ExecuteCommand(const FString& CommandType, const TSharedPtr<FJsonObject>& Params);
+
+	// True for commands the socket thread answers without the game thread
+	// (ping/health_check/set_unattended_mode/get_bridge_events/...). These
+	// must stay available while a game-thread command is in flight or hung.
+	bool IsFastPathCommand(const FString& CommandType) const;
+
+	// Non-blocking dispatch of a game-thread command. The socket loop uses
+	// this so it can keep servicing fast-path commands while the result is
+	// pending (and apply its own 120s timeout).
+	TFuture<FString> DispatchCommandAsync(const FString& CommandType, const TSharedPtr<FJsonObject>& Params);
 
 	// Returns the port the server is currently listening on
 	uint16 GetPort() const { return Port; }
 
+	// Append a structured event to the bridge event ring buffer (thread-safe).
+	// Drained by the get_bridge_events fast-path command — readable even while
+	// the game thread is blocked, which is the whole point.
+	void AddBridgeEvent(const FString& EventType, TSharedPtr<FJsonObject> Payload = nullptr);
+
 private:
+	// Slate pre-tick: re-asserts persistent unattended mode and dismisses
+	// modal windows. Registered on FSlateApplication::OnPreTick because,
+	// unlike FTSTicker, it still fires while a modal loop pumps Slate.
+	void OnSlatePreTick(float DeltaTime);
+
 	// Port file management for Python MCP server auto-discovery
 	void WritePortFile() const;
 	void DeletePortFile() const;
@@ -113,6 +136,31 @@ private:
 	// port file if something (e.g. a cook wiping Saved/) deleted it.
 	FTSTicker::FDelegateHandle StateTickerHandle;
 	uint64 StateTickCount = 0;
+
+	// Non-interactive (unattended) mode: persistent GIsRunningUnattendedScript
+	// + modal auto-dismiss. Set from the socket thread, applied on the game
+	// thread by OnSlatePreTick.
+	std::atomic<bool> bUnattendedMode{false};
+	std::atomic<bool> bDismissModals{true};
+	// Game-thread-only sentinel state. While unattended mode is on, Slate
+	// cancels all non-slow-task modals itself, so any modal that appears
+	// AFTER the mode was enabled is a slow-task progress window — leave it
+	// alone. Only a modal that predates the enable time (editor already hung
+	// when the agent flipped the mode) gets dismissed: the recovery case.
+	bool bAppliedUnattended = false;
+	double UnattendedEnableTime = 0.0;
+	TWeakPtr<SWindow> LastObservedModal;
+	double ModalFirstSeenTime = 0.0;
+	bool bModalPresenceRecorded = false;
+	FDelegateHandle SlatePreTickHandle;
+	// Cross-thread modal visibility for health_check (title under EventsCS).
+	std::atomic<bool> bModalActive{false};
+	FString CachedModalTitle;
+
+	// Bridge event ring buffer (modal_dismissed, command_timeout, ...).
+	mutable FCriticalSection EventsCS;
+	TArray<TSharedPtr<FJsonObject>> BridgeEvents;
+	uint64 EventSeq = 0;
 
 	// Command handler instances
 	TSharedPtr<FEpicUnrealMCPEditorCommands> EditorCommands;

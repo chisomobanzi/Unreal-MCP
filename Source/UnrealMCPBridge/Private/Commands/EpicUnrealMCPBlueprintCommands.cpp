@@ -15,6 +15,7 @@
 #include "Engine/Engine.h"
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "Kismet2/KismetEditorUtilities.h"
+#include "Kismet2/CompilerResultsLog.h"
 #include "Engine/SimpleConstructionScript.h"
 #include "Engine/SCS_Node.h"
 #include "UObject/Field.h"
@@ -515,11 +516,30 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPBlueprintCommands::HandleCompileBlueprint(
 			FString::Printf(TEXT("Blueprint not found: %s"), *BlueprintName));
 	}
 
-	FKismetEditorUtilities::CompileBlueprint(Blueprint);
+	FCompilerResultsLog Results;
+	FKismetEditorUtilities::CompileBlueprint(Blueprint, EBlueprintCompileOptions::None, &Results);
+
+	const bool bHasErrors = Results.NumErrors > 0 || Blueprint->Status == BS_Error;
 
 	TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
 	ResultObj->SetStringField(TEXT("name"), BlueprintName);
-	ResultObj->SetBoolField(TEXT("compiled"), true);
+	ResultObj->SetBoolField(TEXT("compiled"), !bHasErrors);
+	ResultObj->SetNumberField(TEXT("num_errors"), Results.NumErrors);
+	ResultObj->SetNumberField(TEXT("num_warnings"), Results.NumWarnings);
+
+	if (Results.NumErrors > 0 || Results.NumWarnings > 0)
+	{
+		TArray<TSharedPtr<FJsonValue>> Messages;
+		for (const TSharedRef<FTokenizedMessage>& Msg : Results.Messages)
+		{
+			if (Msg->GetSeverity() == EMessageSeverity::Error
+				|| Msg->GetSeverity() == EMessageSeverity::Warning)
+			{
+				Messages.Add(MakeShared<FJsonValueString>(Msg->ToText().ToString()));
+			}
+		}
+		ResultObj->SetArrayField(TEXT("messages"), Messages);
+	}
 	return ResultObj;
 }
 

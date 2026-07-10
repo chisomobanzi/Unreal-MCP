@@ -31,6 +31,10 @@ uint32 FMCPServerRunnable::Run()
 
 	while (bRunning)
 	{
+		// Completion/timeout of the in-flight game-thread command (never
+		// blocks — this is what keeps the fast path alive during hangs).
+		ServicePendingCommand();
+
 		bool bPending = false;
 		if (ListenerSocket->HasPendingConnection(bPending) && bPending)
 		{
@@ -116,38 +120,40 @@ uint32 FMCPServerRunnable::Run()
 					{
 						UE_LOG(LogTemp, Display, TEXT("UnrealMCP: Executing: %s"), *CommandType);
 
-						FString Response = Bridge->ExecuteCommand(
-							CommandType, JsonObject->GetObjectField(TEXT("params")));
-
-						FTCHARToUTF8 UTF8Response(*Response);
-						const uint8* JsonData = (const uint8*)UTF8Response.Get();
-						int32 JsonSize = UTF8Response.Length();
-
-						UE_LOG(LogTemp, Display,
-							TEXT("UnrealMCP: Sending response for %s (%d bytes)"),
-							*CommandType, JsonSize);
-
-						// Length-prefix framing: 4-byte big-endian header + JSON payload
-						uint8 LengthHeader[4];
-						LengthHeader[0] = (uint8)((JsonSize >> 24) & 0xFF);
-						LengthHeader[1] = (uint8)((JsonSize >> 16) & 0xFF);
-						LengthHeader[2] = (uint8)((JsonSize >> 8) & 0xFF);
-						LengthHeader[3] = (uint8)(JsonSize & 0xFF);
-
-						if (SendAllBytes(LengthHeader, 4) && SendAllBytes(JsonData, JsonSize))
+						if (Bridge->IsFastPathCommand(CommandType))
 						{
-							UE_LOG(LogTemp, Display,
-								TEXT("UnrealMCP: Sent %d bytes for %s"),
-								JsonSize, *CommandType);
+							// Answers inline on this thread — available even
+							// while a game-thread command is pending/hung.
+							const FString Response = Bridge->ExecuteCommand(
+								CommandType, JsonObject->GetObjectField(TEXT("params")));
+							if (!SendFramedResponse(ClientSocket, Response, CommandType))
+							{
+								ClientSocket->Close();
+								ClientSocket.Reset();
+								ResetRecvState();
+							}
+						}
+						else if (bHasPending)
+						{
+							// Single in-flight game-thread command by design.
+							const FString Busy = FString::Printf(
+								TEXT("{\"status\":\"error\",\"error\":\"bridge busy: '%s' still executing on the game thread\",\"retryable\":true}"),
+								*PendingCommandType);
+							if (!SendFramedResponse(ClientSocket, Busy, CommandType))
+							{
+								ClientSocket->Close();
+								ClientSocket.Reset();
+								ResetRecvState();
+							}
 						}
 						else
 						{
-							UE_LOG(LogTemp, Error,
-								TEXT("UnrealMCP: Failed to send response for %s"),
-								*CommandType);
-							ClientSocket->Close();
-							ClientSocket.Reset();
-							ResetRecvState();
+							bHasPending = true;
+							PendingCommandType = CommandType;
+							PendingStartTime = FPlatformTime::Seconds();
+							PendingSocket = ClientSocket;
+							PendingFuture = Bridge->DispatchCommandAsync(
+								CommandType, JsonObject->GetObjectField(TEXT("params")));
 						}
 					}
 					else
@@ -246,7 +252,97 @@ bool FMCPServerRunnable::TryExtractMessage(FString& OutMessage)
 	return true;
 }
 
-bool FMCPServerRunnable::SendAllBytes(const uint8* Data, int32 Size)
+void FMCPServerRunnable::ServicePendingCommand()
+{
+	if (!bHasPending)
+	{
+		return;
+	}
+
+	if (PendingFuture.IsReady())
+	{
+		const FString Response = PendingFuture.Get();
+		if (PendingSocket.IsValid() && PendingSocket == ClientSocket)
+		{
+			if (!SendFramedResponse(PendingSocket, Response, PendingCommandType))
+			{
+				ClientSocket->Close();
+				ClientSocket.Reset();
+				ResetRecvState();
+			}
+		}
+		else
+		{
+			// The requesting client was replaced/disconnected while its
+			// command ran; nowhere to deliver the result.
+			UE_LOG(LogTemp, Warning,
+				TEXT("UnrealMCP: dropping result of '%s' — client gone"),
+				*PendingCommandType);
+		}
+		bHasPending = false;
+		PendingFuture = TFuture<FString>();
+		PendingSocket.Reset();
+		return;
+	}
+
+	constexpr double TimeoutSeconds = 120.0;
+	if (FPlatformTime::Seconds() - PendingStartTime > TimeoutSeconds)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("UnrealMCP: Command '%s' timed out after %.0fs waiting for game thread"),
+			*PendingCommandType, TimeoutSeconds);
+
+		TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+		Payload->SetStringField(TEXT("command"), PendingCommandType);
+		Payload->SetNumberField(TEXT("timeout_seconds"), TimeoutSeconds);
+		Bridge->AddBridgeEvent(TEXT("command_timeout"), Payload);
+
+		if (PendingSocket.IsValid() && PendingSocket == ClientSocket)
+		{
+			SendFramedResponse(PendingSocket,
+				TEXT("{\"status\":\"error\",\"error\":\"Command timed out waiting for game thread\"}"),
+				PendingCommandType);
+		}
+		// Abandon the future — if the game thread ever finishes the lambda,
+		// the result has no reader and is discarded.
+		bHasPending = false;
+		PendingFuture = TFuture<FString>();
+		PendingSocket.Reset();
+	}
+}
+
+bool FMCPServerRunnable::SendFramedResponse(
+	const TSharedPtr<FSocket>& Socket, const FString& Response, const FString& CommandType)
+{
+	if (!Socket.IsValid())
+	{
+		return false;
+	}
+
+	FTCHARToUTF8 UTF8Response(*Response);
+	const uint8* JsonData = (const uint8*)UTF8Response.Get();
+	const int32 JsonSize = UTF8Response.Length();
+
+	// Length-prefix framing: 4-byte big-endian header + JSON payload
+	uint8 LengthHeader[4];
+	LengthHeader[0] = (uint8)((JsonSize >> 24) & 0xFF);
+	LengthHeader[1] = (uint8)((JsonSize >> 16) & 0xFF);
+	LengthHeader[2] = (uint8)((JsonSize >> 8) & 0xFF);
+	LengthHeader[3] = (uint8)(JsonSize & 0xFF);
+
+	if (SendAllBytes(Socket, LengthHeader, 4) && SendAllBytes(Socket, JsonData, JsonSize))
+	{
+		UE_LOG(LogTemp, Display,
+			TEXT("UnrealMCP: Sent %d bytes for %s"), JsonSize, *CommandType);
+		return true;
+	}
+
+	UE_LOG(LogTemp, Error,
+		TEXT("UnrealMCP: Failed to send response for %s"), *CommandType);
+	return false;
+}
+
+bool FMCPServerRunnable::SendAllBytes(const TSharedPtr<FSocket>& Socket, const uint8* Data, int32 Size)
 {
 	int32 TotalSent = 0;
 	int32 StallCount = 0;
@@ -255,7 +351,7 @@ bool FMCPServerRunnable::SendAllBytes(const uint8* Data, int32 Size)
 	while (TotalSent < Size)
 	{
 		int32 BytesSent = 0;
-		bool bOk = ClientSocket->Send(Data + TotalSent, Size - TotalSent, BytesSent);
+		bool bOk = Socket->Send(Data + TotalSent, Size - TotalSent, BytesSent);
 
 		if (bOk && BytesSent > 0)
 		{

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Async/Future.h"
 #include "HAL/Runnable.h"
 #include "Sockets.h"
 #include "Interfaces/IPv4/IPv4Address.h"
@@ -23,8 +24,14 @@ public:
 	virtual void Exit() override;
 
 private:
-	/** Send all bytes with EWOULDBLOCK retry. Returns false on fatal error. */
-	bool SendAllBytes(const uint8* Data, int32 Size);
+	/** Send all bytes to a socket with EWOULDBLOCK retry. Returns false on fatal error. */
+	bool SendAllBytes(const TSharedPtr<FSocket>& Socket, const uint8* Data, int32 Size);
+
+	/** Frame (4-byte big-endian length) and send a JSON response. */
+	bool SendFramedResponse(const TSharedPtr<FSocket>& Socket, const FString& Response, const FString& CommandType);
+
+	/** Service the in-flight game-thread command, if any (completion/timeout). */
+	void ServicePendingCommand();
 
 	/**
 	 * Try to extract a complete length-prefixed message from RecvBuffer.
@@ -46,4 +53,14 @@ private:
 	// a complete message (4-byte header + payload) is available.
 	TArray<uint8> RecvBuffer;
 	int32 RecvBufferReadOffset = 0;
+
+	// At most one game-thread command is in flight. The socket loop does NOT
+	// block on it — it keeps accepting connections and answering fast-path
+	// commands (health_check/set_unattended_mode/get_bridge_events/...) so
+	// the bridge stays reachable while the game thread is busy or hung.
+	bool bHasPending = false;
+	TFuture<FString> PendingFuture;
+	FString PendingCommandType;
+	double PendingStartTime = 0.0;
+	TSharedPtr<FSocket> PendingSocket;
 };

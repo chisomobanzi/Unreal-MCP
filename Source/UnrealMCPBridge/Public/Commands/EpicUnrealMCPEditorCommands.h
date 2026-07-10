@@ -48,4 +48,12 @@ private:
 	// Shot capture
 	TSharedPtr<FJsonObject> HandleCaptureFromCamera(const TSharedPtr<FJsonObject>& Params);
 	TSharedPtr<FJsonObject> HandleContactSheet(const TSharedPtr<FJsonObject>& Params);
+
+	// Telemetry
+	TSharedPtr<FJsonObject> HandleGetResourceStats(const TSharedPtr<FJsonObject>& Params);
+
+	// Test-only: raises a raw Slate modal outside any command scope, to drill
+	// the unattended-mode modal sentinel (the unattended flag cannot suppress
+	// this class of dialog).
+	TSharedPtr<FJsonObject> HandleDebugOpenModal(const TSharedPtr<FJsonObject>& Params);
 };

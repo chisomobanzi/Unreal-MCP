@@ -15,6 +15,13 @@
 #include "IImageWrapperModule.h"
 #include "ImageUtils.h"
 #include "RenderingThread.h"
+#include "RHI.h"
+#include "DynamicRHI.h"
+#include "UnrealEngine.h"
+#include "Async/Async.h"
+#include "Containers/Ticker.h"
+#include "Widgets/SWindow.h"
+#include "Widgets/Text/STextBlock.h"
 #include "Camera/CameraComponent.h"
 #include "Framework/Application/SlateApplication.h"
 
@@ -133,9 +140,96 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleCommand(
 	{
 		return HandleContactSheet(Params);
 	}
+	else if (CommandType == TEXT("get_resource_stats"))
+	{
+		return HandleGetResourceStats(Params);
+	}
+	else if (CommandType == TEXT("debug_open_modal"))
+	{
+		return HandleDebugOpenModal(Params);
+	}
 
 	return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
 		FString::Printf(TEXT("Unknown editor command: %s"), *CommandType));
+}
+
+// No public header declares these in 5.6; engine code declares them extern
+// at use sites (e.g. EngineAnalyticsSessionSummary.cpp) — same here.
+extern ENGINE_API float GAverageFPS;
+extern ENGINE_API float GAverageMS;
+
+TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleGetResourceStats(
+	const TSharedPtr<FJsonObject>& Params)
+{
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	constexpr double MB = 1024.0 * 1024.0;
+
+	const FPlatformMemoryStats MemStats = FPlatformMemory::GetStats();
+	Result->SetNumberField(TEXT("process_physical_mb"), MemStats.UsedPhysical / MB);
+	Result->SetNumberField(TEXT("process_physical_peak_mb"), MemStats.PeakUsedPhysical / MB);
+	Result->SetNumberField(TEXT("process_virtual_mb"), MemStats.UsedVirtual / MB);
+	Result->SetNumberField(TEXT("system_physical_free_mb"), MemStats.AvailablePhysical / MB);
+	Result->SetNumberField(TEXT("system_physical_total_mb"), MemStats.TotalPhysical / MB);
+
+	FTextureMemoryStats TexStats;
+	RHIGetTextureMemoryStats(TexStats);
+	if (TexStats.DedicatedVideoMemory > 0)
+	{
+		Result->SetNumberField(TEXT("vram_dedicated_mb"), TexStats.DedicatedVideoMemory / MB);
+	}
+	if (TexStats.TotalGraphicsMemory > 0)
+	{
+		Result->SetNumberField(TEXT("vram_total_mb"), TexStats.TotalGraphicsMemory / MB);
+	}
+	Result->SetNumberField(TEXT("texture_streaming_mb"), TexStats.StreamingMemorySize / MB);
+	Result->SetNumberField(TEXT("texture_nonstreaming_mb"), TexStats.NonStreamingMemorySize / MB);
+	if (TexStats.TexturePoolSize > 0)
+	{
+		Result->SetNumberField(TEXT("texture_pool_mb"), TexStats.TexturePoolSize / MB);
+	}
+
+	Result->SetNumberField(TEXT("average_fps"), GAverageFPS);
+	Result->SetNumberField(TEXT("average_frame_ms"), GAverageMS);
+	Result->SetBoolField(TEXT("pie_active"), GEditor && GEditor->PlayWorld != nullptr);
+	Result->SetBoolField(TEXT("success"), true);
+	return Result;
+}
+
+TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleDebugOpenModal(
+	const TSharedPtr<FJsonObject>& Params)
+{
+	// Deferred ~0.5s so the modal opens well AFTER this command returns —
+	// replicating dialogs raised outside a command window (PIE-start
+	// prompts, deferred imports). With unattended mode OFF this hangs the
+	// game thread for real; the recovery path (fast-path
+	// set_unattended_mode(true) + sentinel dismissal) must un-wedge it.
+	FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+		[](float) -> bool
+	{
+		if (!FSlateApplication::IsInitialized())
+		{
+			return false;
+		}
+		TSharedRef<SWindow> Window = SNew(SWindow)
+			.Title(FText::FromString(TEXT("MCP sentinel drill modal")))
+			.ClientSize(FVector2D(420, 120))
+			.SupportsMaximize(false)
+			.SupportsMinimize(false)
+			[
+				SNew(STextBlock)
+				.Text(FText::FromString(TEXT(
+					"If you can read this, the unattended-mode modal sentinel "
+					"failed to dismiss it. Close manually.")))
+			];
+		FSlateApplication::Get().AddModalWindow(Window, nullptr);
+		return false; // one-shot
+	}), 0.5f);
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetBoolField(TEXT("success"), true);
+	Result->SetStringField(TEXT("note"),
+		TEXT("modal opens in ~0.5s outside command scope; recovery must dismiss it"));
+	return Result;
 }
 
 TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleGetActorsInLevel(

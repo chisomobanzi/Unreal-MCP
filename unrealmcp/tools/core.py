@@ -37,6 +37,70 @@ def health_check() -> str:
 
 
 @mcp.tool()
+def set_unattended_mode(enabled: bool = True, dismiss_modals: bool = True) -> str:
+    """Toggle the bridge's persistent non-interactive mode.
+
+    While enabled, GIsRunningUnattendedScript stays set between commands
+    (dialogs raised OUTSIDE a command window — PIE-start prompts, deferred
+    imports — take their default answer instead of blocking the editor), and
+    a Slate-tick sentinel auto-dismisses any modal window that appears
+    anyway, recording a `modal_dismissed` bridge event.
+
+    This is a fast-path command: it works even while the game thread is
+    already blocked by a modal, so enabling it mid-hang un-wedges the editor.
+
+    Leave OFF when a human is using the editor interactively — unattended
+    mode silently answers their dialogs too.
+    """
+    try:
+        resp = _tcp_send_raw("set_unattended_mode",
+                             {"enabled": enabled, "dismiss_modals": dismiss_modals})
+        if resp.get("status") == "error":
+            return f"Error: {resp.get('error', 'bridge not reachable')}"
+        return json.dumps(resp.get("result", resp), indent=2)
+    except Exception as exc:
+        return f"Error: {exc}"
+
+
+@mcp.tool()
+def get_bridge_events(since: float = 0, clear: bool = False) -> str:
+    """Drain the bridge's structured event buffer (fast-path).
+
+    Events: `modal_dismissed` (title of an auto-dismissed dialog),
+    `command_timeout` (a command's 120s game-thread wait expired — the usual
+    sign of a hung/modal game thread), `unattended_mode_changed`.
+
+    Readable even while the game thread is hung — use it to find out WHY the
+    editor stopped answering. `since` filters to events with seq greater than
+    it; `clear=True` empties the buffer after reading.
+    """
+    try:
+        resp = _tcp_send_raw("get_bridge_events", {"since": since, "clear": clear})
+        if resp.get("status") == "error":
+            return f"Error: {resp.get('error', 'bridge not reachable')}"
+        return json.dumps(resp.get("result", resp), indent=2)
+    except Exception as exc:
+        return f"Error: {exc}"
+
+
+@mcp.tool()
+def get_resource_stats() -> str:
+    """Editor resource telemetry: RAM, VRAM, frame time, PIE state.
+
+    Returns process/system memory (MB), dedicated/allocated VRAM when the
+    RHI reports it, average FPS / frame ms, and whether PIE is running.
+    Use to spot memory pressure before an OOM kills a long batch.
+    """
+    try:
+        resp = _tcp_send_raw("get_resource_stats")
+        if resp.get("status") == "error":
+            return f"Error: {resp.get('error', 'bridge not reachable')}"
+        return json.dumps(resp.get("result", resp), indent=2)
+    except Exception as exc:
+        return f"Error: {exc}"
+
+
+@mcp.tool()
 def wait_until_ready(timeout_seconds: float = 600.0, poll_interval: float = 3.0) -> str:
     """Block until the editor is up AND ready for commands, or time out.
 

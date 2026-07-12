@@ -150,3 +150,54 @@ real flow (mission start → tutor loads → walk up → hand-ray a UI action �
 Guardrails: shared editor (check cooks/PIE before restart; editor-cycle.sh only), commit to
 THIS repo by pathspec, existing tools regression-clean (validate_bridge.py), log tool gaps in
 Notion "Unreal MCP" tracker.
+
+---
+
+## Status log
+
+### Phase 1 shipped (2026-07-10) — commits 61ff0e3 (1a), 797631d (1b), 6a9e9db (1c), +1d
+
+What we learned live (design corrections):
+
+1. **Slate cancels raw modals itself under `GIsRunningUnattendedScript`**
+   (`AddModalWindow` → "The window was canceled", except `bSlowTaskWindow`).
+   So prevention = the persistent flag alone; while unattended is ON, the only
+   windows `GetActiveModalWindow()` can return are slow-task progress dialogs —
+   and dismissing those ABORTS legitimate work (killed a `load_level` once).
+   The sentinel therefore dismisses **only modals that predate the unattended
+   enable time** (recovery of an already-hung editor via the fast-path toggle);
+   later modals are recorded as `modal_present` and left alone.
+2. **Slate's modal loop services the game-thread TaskGraph** — AsyncTask-based
+   bridge commands still execute while a modal is up; it's the ENGINE tick
+   (PIE, FTSTicker, timers) that freezes. With the non-blocking socket loop the
+   bridge is never dark during a modal. `health_check.modal_active/modal_title`
+   (maintained from the Slate pre-tick, which runs inside modal loops) is the
+   hang-cause signal.
+3. **The socket loop was the real single point of failure**: it used to block
+   120 s on the game-thread future, making even ping/health_check unreachable
+   during a hang. Now: one in-flight game-thread command (busy error for
+   concurrent ones, retryable), fast path always serviced.
+4. **`compile_blueprint` lied** (hardcoded `compiled: true`) — same class as
+   the old `save_all` bug. Fixed with FCompilerResultsLog (errors/warnings/
+   messages). Needed for any drill that requires a genuinely broken BP.
+5. **Exit crashes leave zombie process trees**: SIGSEGV during editor shutdown
+   (teardown-order, not MCP frames) leaves the pid held by CrashReportClient
+   and then apport mid-core-dump for minutes — `pgrep` says "running", graceful
+   stops wait forever. The watchdog classifies pid+remnant as **crashed** and
+   kills CrashReportClient/apport before relaunching.
+6. **PIE inside a never-saved `new_level` + map switch = editor crash**
+   (`TickTaskManager !LevelList.Contains` assert during world GC). Drills save
+   the scratch level and settle + `obj gc` after `stop_pie` before switching.
+7. `LevelEditorSubsystem.load_level` returns False on success sometimes, and
+   the editor-world pointer is briefly null right after a load — verify map
+   switches via a follow-up `get_world_info`, never the bool.
+
+Proof suites (all green): `scripts/validate_harness.py` 37 checks (suppression
+drill, hang→recovery drill, PIE-with-broken-BP drill in an isolated scratch
+level), `scripts/validate_capture.py` 10 (editor+PIE capture while minimized),
+`scripts/validate_recovery.py` 10 (SIGKILL mid-op → auto-relaunch 22 s →
+commands round-trip), `scripts/validate_batch.py` (crash-resumable batch),
+`validate_bridge.py` 24/24 regression, pytest 32 (transport + watchdog + batch).
+
+New tools: `set_unattended_mode`, `get_bridge_events`, `get_resource_stats`,
+`get_editor_state`, `recover_editor`, `run_batch` (+ raw `debug_open_modal`).

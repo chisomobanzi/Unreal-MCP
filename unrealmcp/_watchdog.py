@@ -66,11 +66,19 @@ def classify(p: Dict[str, Any]) -> Dict[str, Any]:
         return st
 
     # No bridge answer.
-    if fresh_crash or st["remnant_pids"]:
+    shutdown_marker = p.get("shutdown_marker")
+    if fresh_crash or st["remnant_pids"] or (st["editor_pids"] and shutdown_marker):
         st["state"] = "crashed"
         if crash:
             st["crash_dir"] = crash[0]
             st["crash_summary"] = crash[1]
+        if shutdown_marker:
+            # Post-crash corpse: process alive but its log ends in a crash-
+            # shutdown marker — it can squat the port for days. Treat its
+            # own pid as a remnant so recovery kills it.
+            st["crash_summary"] = (st.get("crash_summary") or
+                                   f"wedged shutdown: {shutdown_marker}")
+            st["remnant_pids"] = sorted(set(st["remnant_pids"] + st["editor_pids"]))
         return st
 
     if st["editor_pids"]:
@@ -183,8 +191,38 @@ def _editor_listener_port(editor_pids: List[int]) -> Optional[int]:
         if not any(f"pid={pid}" in line for pid in editor_pids):
             continue
         m = re.search(r"127\.0\.0\.1:(\d{4,5})\s", line)
-        if m:
+        # The editor owns several localhost listeners (live coding, trace,
+        # crash pipes) — only the MCP port-scan range counts.
+        if m and 55557 <= int(m.group(1)) <= 55557 + 100:
             return int(m.group(1))
+    return None
+
+
+def _log_shutdown_marker(project_dir: str) -> Optional[str]:
+    """Crash/exit marker in the tail of the project log, if any.
+
+    A wedged post-crash editor keeps its pid and listeners alive while the
+    log ends in StaticShutdownAfterError — held our port for 2 days once.
+    """
+    logs = glob.glob(os.path.join(project_dir, "Saved", "Logs", "*.log"))
+    if not logs:
+        return None
+    latest = max(logs, key=os.path.getmtime)
+    try:
+        with open(latest, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 8192))
+            tail = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    # Marker in the last few lines counts — a dying editor can emit a couple
+    # of trailing lines after it. "LogExit: Exiting" included: if the pid is
+    # still alive with a completed exit log, the shutdown wedged.
+    last_lines = "\n".join(tail.splitlines()[-6:])
+    for marker in ("StaticShutdownAfterError", "=== Critical error: ===",
+                   "LogExit: Exiting"):
+        if marker in last_lines:
+            return marker
     return None
 
 
@@ -218,9 +256,14 @@ def collect_probes(project_dir: Optional[str] = None) -> Dict[str, Any]:
         except OSError:
             crash = None
 
+    shutdown_marker = None
+    if health is None and editor_pids:
+        shutdown_marker = _log_shutdown_marker(root)
+
     return dict(port=port, health=health, editor_pids=editor_pids,
                 remnant_pids=remnant_pids, cook_pids=cook_pids,
                 listener_port=listener, latest_crash=crash, now=time.time(),
+                shutdown_marker=shutdown_marker,
                 project_dir=root, port_file=port_file)
 
 

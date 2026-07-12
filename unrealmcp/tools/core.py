@@ -136,6 +136,31 @@ def recover_editor(wait_timeout_seconds: float = 600.0) -> str:
 
 
 @mcp.tool()
+def run_batch(command: str, items_json: str, batch_id: str,
+              checkpoint: bool = True) -> str:
+    """Run a bridge command once per item, crash-safe and resumable.
+
+    `items_json` is a JSON array of params objects — one call of `command`
+    per element. After every item the checkpoint
+    (Saved/UnrealMCP/batches/<batch_id>.json) is rewritten, so an editor
+    crash mid-batch loses at most the in-flight item: the watchdog
+    (recover_editor) relaunches the editor and the item is retried once.
+    Re-invoking with the same batch_id resumes from the checkpoint instead
+    of redoing finished items. Tool-level errors are recorded per item and
+    do not stop the batch.
+    """
+    from unrealmcp._batch import run_batch as _run
+    try:
+        items = json.loads(items_json)
+        if not isinstance(items, list):
+            return "Error: items_json must be a JSON array of params objects"
+        return json.dumps(_run(command, items, batch_id, checkpoint=checkpoint),
+                          indent=2, default=str)
+    except Exception as exc:
+        return f"Error: {exc}"
+
+
+@mcp.tool()
 def wait_until_ready(timeout_seconds: float = 600.0, poll_interval: float = 3.0) -> str:
     """Block until the editor is up AND ready for commands, or time out.
 

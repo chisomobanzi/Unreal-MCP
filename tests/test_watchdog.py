@@ -69,6 +69,24 @@ def test_old_crash_dir_is_not_a_crash():
     assert st["state"] == "not_running"
 
 
+def test_wedged_shutdown_is_crashed():
+    # Process alive + listener bound, but the bridge never answers and the
+    # log ends in a crash-shutdown marker: a post-crash corpse squatting the
+    # port (held one for 2 days live). Must classify crashed + kill the pid.
+    st = wd.classify(probes(editor_pids=[42], listener_port=55557,
+                            shutdown_marker="StaticShutdownAfterError"))
+    assert st["state"] == "crashed"
+    assert "StaticShutdownAfterError" in st["crash_summary"]
+    d = wd.plan_recovery(st)
+    assert d["action"] == "relaunch"
+    assert 42 in d["kill_remnants"]
+
+
+def test_booting_without_shutdown_marker_is_not_crashed():
+    st = wd.classify(probes(editor_pids=[42], shutdown_marker=None))
+    assert st["state"] == "running_booting"
+
+
 def test_crash_remnant_pid_is_crashed_not_running():
     # Editor pid technically alive but held by CrashReportClient/apport:
     # classify as crashed, NOT running (bit us: editor-cycle waited 90s).

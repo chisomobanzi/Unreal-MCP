@@ -201,3 +201,51 @@ commands round-trip), `scripts/validate_batch.py` (crash-resumable batch),
 
 New tools: `set_unattended_mode`, `get_bridge_events`, `get_resource_stats`,
 `get_editor_state`, `recover_editor`, `run_batch` (+ raw `debug_open_modal`).
+
+### Phase 2+3 shipped (2026-07-12) — commits 9dfe29b (2a), 3b1d4d0 (2b/2c), +capstone
+
+Agent-as-player, Python-first (`unrealmcp/_player.py` over execute_python;
+C++ only where Python hits reflection walls):
+
+- `get_pawn_state` / `move_to` / `look_at` / `teleport_to_room` /
+  `stand_before` — every destination navmesh-projected (extent 250/250/400)
+  + capsule-half-height offset; authored Zs corrected by construction.
+- `hand_ray_click` (C++): poses the ray like a raised VR hand just off the
+  widget face and drives `WidgetInteractionComponent::TickComponent`
+  manually — deterministic hover→press→release. Python wrapper
+  `hand_ray_select` retries through target-mesh occluders and flags
+  `needed_occluder_bypass` (= a real player can't reach that widget).
+- `get_runtime_widget_tree` (C++): live UserWidget trees with per-widget
+  visibility/enabled/text/object-path (unreachable from Python).
+  `interact()` resolves Buttons by path and broadcasts OnClicked.
+- `playthrough(flow)`: beat-scripted flows with assert_state
+  (pie_active / pawn_near / widget_text_contains / log_contains), crash →
+  watchdog → full replay (game state can't checkpoint mid-PIE).
+
+Python-reflection walls found (why the C++ trio exists): no component
+registration, no live WidgetTree access, `unreal.Key()` kwargs, struct
+ctor quirks, `CollisionResponseType.ECR_*` naming, world-pointer briefly
+null after `load_level` (verify via follow-up `get_world_info`).
+
+**Acceptance run (scripts/validate_playthrough.py) 10/10, unattended:**
+17-beat Engine-Room flow (ship map → PIE → Observatory → Engine Room →
+hand-ray a skill pod → detail verified from widget-tree text + analytics
+log → capture → stop), with a raw modal raised MID-FLOW auto-resolved, the
+PIE capture taken while the editor window was minimized, and a forced
+SIGSEGV mid-flow auto-recovered (1 restart, ~22 s) with the flow replayed
+to completion. Zero human intervention; xdotool used only to minimize the
+window. Suites: harness 37, bridge 24 (regression), player 18,
+interaction 17, capture 10, recovery 10, batch 7, pytest 41.
+
+Un-wedge note: enabling unattended mid-hang clears a modal by TWO racing
+mechanisms — Slate's modal loop exits once GIsRunningUnattendedScript is
+re-asserted, and the sentinel dismisses the window. Assert the outcome
+(health_check.modal_active false), not the mechanism.
+
+**PROJECT FINDING (for Chisomo, found by the harness):** the Engine Room
+skill-pod readouts are fully enclosed by their own `BlockAll` /
+`BlockAllDynamic` meshes on ECC_Visibility — a real player's VR ray cannot
+click them from ANY angle (45-pose sweep, zero clear lines). The
+eb568f91 widget-collision fix is intact and Button_Base→ShowPodDetail
+wiring works (proven via interact()); the pod ENCLOSURE mesh needs its
+visibility response set to Ignore (or the readout moved outside it).

@@ -101,6 +101,30 @@ def get_widget_tree_runtime(actor: str = "", include_viewport: bool = False) -> 
 
 
 @mcp.tool()
+def playthrough(flow_json: str, max_restarts: int = 1) -> str:
+    """Run a scripted VR flow unattended, beat by beat, crash-safe.
+
+    flow_json: {"name": ..., "beats": [{"action": ..., "args": {...}}, ...]}
+    Actions: load_map, start_pie, stop_pie, wait, capture, exec, raw,
+    get_pawn_state, teleport_to_room, move_to, look_at, stand_before,
+    hand_ray_select, interact, assert_state.
+
+    assert_state args: pie_active, pawn_near {x,y,z,tolerance},
+    widget_text_contains {actor,text}, log_contains (project log since the
+    previous action). Unattended mode is enabled for the run (dialogs
+    auto-default); an editor crash triggers the watchdog and one full
+    replay. Returns the per-beat report + bridge events.
+    """
+    from unrealmcp._playthrough import run_playthrough
+    try:
+        flow = json.loads(flow_json)
+        return json.dumps(run_playthrough(flow, max_restarts=max_restarts),
+                          indent=2, default=str)
+    except Exception as exc:
+        return f"Error: {exc}"
+
+
+@mcp.tool()
 def teleport_to_room(room: str) -> str:
     """Teleport the pawn to a named room (e.g. "Observatory", "Engine").
 

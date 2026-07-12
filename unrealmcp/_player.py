@@ -29,7 +29,8 @@ def _exec(code: str, timeout: Optional[float] = None) -> Dict[str, Any]:
         try:
             return json.loads(payload)
         except json.JSONDecodeError:
-            return {"ok": False, "error": f"unparseable snippet result: {payload[:300]}"}
+            # user-authored exec snippets may return plain strings
+            return {"ok": True, "result": payload}
     if isinstance(payload, dict):
         return payload
     return {"ok": False, "error": f"unexpected result shape: {str(result)[:300]}"}

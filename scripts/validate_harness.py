@@ -172,9 +172,15 @@ result = "scheduled"
     r = result_of(call("get_world_info", {}, timeout=20))
     check("2.8 game thread un-wedged (world info round-trips)",
           r.get("success", True) is not False and "error" not in r, r)
+    # The un-wedge has two racing mechanisms: Slate's own modal loop exits
+    # once GIsRunningUnattendedScript is re-asserted, and the sentinel
+    # dismisses the window. Either way the OUTCOME must hold: no modal left.
+    h = result_of(call("health_check"))
     evs, _ = events_since(pre_modal_seq)
-    check("2.9 modal_dismissed event recorded",
-          any(e.get("type") == "modal_dismissed" for e in evs), evs)
+    dismissed = any(e.get("type") == "modal_dismissed" for e in evs)
+    check("2.9 modal cleared after enabling unattended (event or slate-exit)",
+          h.get("modal_active") is False, {"health": h, "events": evs})
+    print(f"      (cleared by: {'sentinel event' if dismissed else 'slate modal-loop exit'})")
 
     # ---- 3. Modal-sentinel drill: PIE with a broken BP -------------------
     # A level-placed BP with compile errors makes start_pie raise a modal
@@ -284,15 +290,16 @@ result = _prev.split(".")[0]
               {"events": evs, "pie": pie_state})
     print(f"      (sentinel dismissals observed: {len(dismissed)})")
 
-    if isinstance(pie_state, dict) and pie_state.get("pie_active"):
-        call("stop_pie", {})
-        deadline = time.monotonic() + 20
-        while time.monotonic() < deadline:
-            st = result_of(call("get_pie_status", timeout=10))
-            if not st.get("pie_active"):
-                break
-            time.sleep(1)
-    check("3.9 PIE stopped / never ran", True)
+    call("stop_pie", {})
+    pie_stopped = False
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        st = result_of(call("get_pie_status", timeout=10))
+        if not st.get("pie_active"):
+            pie_stopped = True
+            break
+        time.sleep(1)
+    check("3.9 PIE stopped (verified)", pie_stopped)
 
     # Cleanup scratch actor + asset, restore the original map, drop the
     # scratch level without saving it.

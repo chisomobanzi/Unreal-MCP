@@ -15,7 +15,15 @@ Then, from the MCP client, gate on readiness — **don't issue commands during b
 ```
 wait_until_ready()            # polls health_check until ready:true
 ```
-`health_check()` reports `ready`, `world`, `is_loading_assets`, `pie_active`.
+`health_check()` reports `ready`, `world`, `is_loading_assets`, `pie_active`, plus
+`unattended_mode` and `modal_active`/`modal_title` (a modal blocking the engine tick).
+
+**Unattended sessions:** `set_unattended_mode(enabled=True)` makes editor dialogs take
+their safe default (BP-compile-error prompts on PIE, save/import boxes) so nothing can
+block the bridge — and enabling it mid-hang un-wedges an already-stuck editor
+(fast-path command). Turn it off when done: it silently answers a human's dialogs too.
+If the editor dies or wedges, don't hand-roll pkill/relaunch — `get_editor_state()` →
+`recover_editor()` (see `ue-mcp-crash-triage`).
 
 ## Recompile after C++ edits (bridge plugin OR game module)
 The editor must be **closed** — the linker can't replace a loaded `.so`.
@@ -33,4 +41,4 @@ The MCP **Python** package is an editable install (`.venv/bin/pip install -e .`)
 ## Manual launch over SSH (no desktop)
 If `launch-editor.sh` isn't usable, discover the live display (it rotates `:0`/`:1` across logins — never hardcode): `ls /tmp/.X11-unix/` and lift `DISPLAY`/`XAUTHORITY` from a running `gnome-shell`'s `/proc/<pid>/environ`. A wrong DISPLAY silently falls back to SDL `offscreen` and the editor crashes ~8 min later. Use `setsid` so the editor detaches cleanly.
 
-Related: `ue-mcp-crash-triage`, `ue-mcp-verify`.
+Related: `ue-mcp-crash-triage`, `ue-mcp-verify`, `ue-mcp-playtest`.

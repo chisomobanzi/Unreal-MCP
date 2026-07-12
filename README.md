@@ -1,6 +1,6 @@
 # UnrealMCP — AI Bridge for Unreal Engine 5
 
-Control Unreal Engine 5 editor from AI coding assistants (Claude Code, Cursor, Windsurf, etc.). Create materials, blueprints, Niagara VFX, StateTrees, spawn actors, manage data tables, profile performance, and more — **302 commands** across 13 categories, all without leaving your terminal.
+Control Unreal Engine 5 editor from AI coding assistants (Claude Code, Cursor, Windsurf, etc.). Create materials, blueprints, Niagara VFX, StateTrees, spawn actors, manage data tables, profile performance, and more — **318 commands** across 14 categories, all without leaving your terminal.
 
 **Two ways to use it:**
 
@@ -55,8 +55,8 @@ pip install unrealmcp
                     │                                          │
                     │   C++ Plugin (UnrealMCPBridge)           │
                     │   TCP server on localhost:55557           │
-                    │   302 commands: materials, blueprints,   │
-                    │   niagara, statetree, actors, data       │
+                    │   318 commands: materials, blueprints,   │
+                    │   niagara, statetree, actors, playtest,  │
                     │   tables, profiling, and more            │
                     └──────────────┬───────────────────────────┘
                                    │ TCP/JSON
@@ -72,7 +72,7 @@ pip install unrealmcp
           └───────────────────┘              └────────────────────┘
 ```
 
-The C++ plugin runs inside the editor and exposes 302 commands over TCP. The CLI and MCP server are two different front doors to the same plugin.
+The C++ plugin runs inside the editor and exposes 318 commands over TCP. The CLI and MCP server are two different front doors to the same plugin.
 
 ---
 
@@ -439,11 +439,12 @@ The script asks where to create the MCP config:
 
 ---
 
-## All 302 Commands
+## All 318 Commands
 
 | Category | Count | Highlights |
 |----------|------:|-----------|
-| [Core](#core-2) | 2 | health_check, execute_python |
+| [Core](#core-2) | 9 | health_check, execute_python, **reliability layer**: set_unattended_mode, get_editor_state/recover_editor (crash watchdog), run_batch (crash-resumable), get_bridge_events, get_resource_stats |
+| Playtest / Player | 10 | agent-as-player: get_pawn_state, move_to/teleport_to_room/stand_before (navmesh-safe), hand_ray_select (simulated VR ray), interact, get_runtime_state, get_widget_tree_runtime, playthrough(flow) |
 | [Asset Management](#asset-management-16) | 16 | find/list/import/duplicate/rename/delete/save |
 | [Blueprints](#blueprints-22) | 22 | create, compile, variables, functions, graph nodes |
 | [Materials](#materials-35) | 35 | create, build_material_graph, material functions, Substrate |
@@ -923,7 +924,7 @@ Each editor picks a unique port automatically. The CLI and MCP server read the p
 Plugins/UnrealMCP/
 ├── UnrealMCP.uplugin              # Plugin manifest
 ├── cli/                            # Go CLI source (ue-cli)
-│   ├── cmd/                        # Command definitions (302 commands)
+│   ├── cmd/                        # Command definitions (Go registry)
 │   ├── internal/bridge/            # TCP client
 │   ├── internal/project/           # Plugin embedding & project detection
 │   └── npm/                        # npm package wrapper

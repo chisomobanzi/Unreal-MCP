@@ -5,6 +5,17 @@ description: Diagnose why the Unreal MCP bridge stopped responding — distingui
 
 # UE MCP crash / disconnect triage
 
+**Try the watchdog first** (playtest-harness tools): `get_editor_state()` classifies
+the situation — running_ready / running_booting / **hung_modal** (a modal blocks the
+engine tick; `health_check` also reports `modal_active` + title) / **crashed** (fresh
+crash dir, CrashReportClient/apport remnants, or a wedged post-crash corpse still
+squatting the port) / not_running — and includes a recovery plan. `recover_editor()`
+executes it: dismisses a hung modal via fast-path `set_unattended_mode(true)`,
+rewrites a cook-deleted port.txt, or kills remnants + relaunches + waits ready. It
+**refuses during cooks**. `get_bridge_events()` shows what happened while the game
+thread was blocked (modal_dismissed / command_timeout). The manual steps below are
+the fallback when the watchdog itself can't run.
+
 Since the P0 batch the client error is usually **self-explaining** — read it first. A `Failed after 4 attempts: ...` message now branches into "editor is not running", "editor appears to have CRASHED: <assertion> (see <dir>)", or "port file exists but nothing is listening". If it already told you, act on that. Otherwise:
 
 ## 1. Is a process alive?
@@ -32,6 +43,6 @@ The top **non-engine** frame (a path under your project/plugin) is the culprit.
 - `TickTaskManager.cpp` assert right after boot → a command ran before the editor was ready; `wait_until_ready()` first.
 
 ## 4. Recover
-`./launch-editor.sh` handles single-instance, stale-port cleanup, stale-binary purge, and one auto-retry on a boot crash. Then `wait_until_ready()` before issuing commands. Log any *new* MCP-caused crash as a row in the Notion "Unreal MCP" tracker.
+`recover_editor()` does all of this in one call. Manually: `./launch-editor.sh` handles single-instance, stale-port cleanup, stale-binary purge, and one auto-retry on a boot crash. Then `wait_until_ready()` before issuing commands. **Zombie gotcha:** an exit-crash leaves the pid held by CrashReportClient and then `apport` mid-core-dump for minutes — `pgrep` says "running" and graceful stops time out; kill `apport -p<pid>` + CrashReportClient, then relaunch (the watchdog does this for you). Log any *new* MCP-caused crash as a row in the Notion "Unreal MCP" tracker.
 
-Related: `ue-mcp-lifecycle` (launch/restart), `ue-mcp-verify`.
+Related: `ue-mcp-lifecycle` (launch/restart), `ue-mcp-verify`, `ue-mcp-playtest` (watchdog, unattended mode, playthrough flows).

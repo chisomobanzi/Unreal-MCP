@@ -28,6 +28,18 @@ Many effects only apply at **BeginPlay**, not in the editor viewport — e.g. a 
 
 For anything you'll show a human (marketing, review), use `game_view=True` (the default on `capture_from_camera`/`contact_sheet`) to hide gizmos/grid/selection outlines.
 
+## Runtime behavior: verify from STATE, not pixels
+
+For gameplay/BeginPlay-driven behavior, a screenshot proves "it looked right once";
+structured readback proves it works. In PIE:
+- `get_runtime_state(actor_filter=...)` — actor locations + widget-component
+  hit-testability (collision enabled + blocks the interaction channel).
+- `get_widget_tree_runtime(actor=...)` — live widget tree with visibility/enabled/
+  **text**: assert the panel actually shows the new value.
+- Drive the flow like a player first (`teleport_to_room`, `stand_before`,
+  `hand_ray_select`, `interact`) — see `ue-mcp-playtest` for the full agent-as-player
+  loop and the scripted `playthrough()` macro.
+
 ## Gotchas
 - A green `success` from a mutating tool means "the command ran", not "the result is correct". Screenshot.
 - `health_check` returning ok ~1s before a crash is possible — it's liveness, not a guarantee the next command survives.

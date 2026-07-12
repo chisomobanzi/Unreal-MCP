@@ -242,10 +242,14 @@ mechanisms — Slate's modal loop exits once GIsRunningUnattendedScript is
 re-asserted, and the sentinel dismisses the window. Assert the outcome
 (health_check.modal_active false), not the mechanism.
 
-**PROJECT FINDING (for Chisomo, found by the harness):** the Engine Room
-skill-pod readouts are fully enclosed by their own `BlockAll` /
-`BlockAllDynamic` meshes on ECC_Visibility — a real player's VR ray cannot
-click them from ANY angle (45-pose sweep, zero clear lines). The
-eb568f91 widget-collision fix is intact and Button_Base→ShowPodDetail
-wiring works (proven via interact()); the pod ENCLOSURE mesh needs its
-visibility response set to Ignore (or the readout moved outside it).
+**PROJECT FINDING (found by the harness, FIXED same day):** the Engine
+Room skill-pod readouts were fully enclosed by their own `BlockAll` /
+`BlockAllDynamic` meshes on ECC_Visibility — a real player's VR ray could
+not click them from ANY angle (45-pose sweep, zero clear lines), even
+though the eb568f91 widget-collision fix was intact and the
+Button_Base→ShowPodDetail wiring worked. Fixed in project commit
+`4a1617d1`: EngineRoomManager's pod setup now sets the non-widget
+primitives' visibility response to Ignore. Guarded by
+validate_interaction check 4.2b (natural reachability, red→green); the
+`needed_occluder_bypass` flag on `hand_ray_select` results is the
+detector for this whole bug class.

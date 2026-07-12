@@ -22,6 +22,16 @@
 #include "Containers/Ticker.h"
 #include "Widgets/SWindow.h"
 #include "Widgets/Text/STextBlock.h"
+#include "Components/WidgetComponent.h"
+#include "Components/WidgetInteractionComponent.h"
+#include "Components/PanelWidget.h"
+#include "Components/ContentWidget.h"
+#include "Components/TextBlock.h"
+#include "Blueprint/UserWidget.h"
+#include "Blueprint/WidgetTree.h"
+#include "Blueprint/WidgetBlueprintLibrary.h"
+#include "GameFramework/PlayerController.h"
+#include "GameFramework/Pawn.h"
 #include "Camera/CameraComponent.h"
 #include "Framework/Application/SlateApplication.h"
 
@@ -148,6 +158,18 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleCommand(
 	{
 		return HandleDebugOpenModal(Params);
 	}
+	else if (CommandType == TEXT("attach_interaction_ray"))
+	{
+		return HandleAttachInteractionRay(Params);
+	}
+	else if (CommandType == TEXT("get_runtime_widget_tree"))
+	{
+		return HandleGetRuntimeWidgetTree(Params);
+	}
+	else if (CommandType == TEXT("hand_ray_click"))
+	{
+		return HandleHandRayClick(Params);
+	}
 
 	return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
 		FString::Printf(TEXT("Unknown editor command: %s"), *CommandType));
@@ -191,6 +213,380 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleGetResourceStats(
 	Result->SetNumberField(TEXT("average_fps"), GAverageFPS);
 	Result->SetNumberField(TEXT("average_frame_ms"), GAverageMS);
 	Result->SetBoolField(TEXT("pie_active"), GEditor && GEditor->PlayWorld != nullptr);
+	Result->SetBoolField(TEXT("success"), true);
+	return Result;
+}
+
+namespace
+{
+	AActor* FindPIEActorByQuery(UWorld* World, const FString& Query)
+	{
+		const FString Q = Query.ToLower();
+		AActor* Best = nullptr;
+		for (TActorIterator<AActor> It(World); It; ++It)
+		{
+			AActor* A = *It;
+			const FString Label = A->GetActorLabel().ToLower();
+			const FString Name = A->GetName().ToLower();
+			if (Label == Q || Name == Q)
+			{
+				return A;
+			}
+			if (!Best && (Label.Contains(Q) || Name.Contains(Q)))
+			{
+				Best = A;
+			}
+		}
+		return Best;
+	}
+
+	void WalkWidgetTree(UWidget* Widget, int32 Depth,
+		TArray<TSharedPtr<FJsonValue>>& Out, int32& Budget)
+	{
+		if (!Widget || Budget <= 0)
+		{
+			return;
+		}
+		--Budget;
+
+		TSharedPtr<FJsonObject> Entry = MakeShared<FJsonObject>();
+		Entry->SetStringField(TEXT("name"), Widget->GetName());
+		Entry->SetStringField(TEXT("class"), Widget->GetClass()->GetName());
+		Entry->SetNumberField(TEXT("depth"), Depth);
+		Entry->SetStringField(TEXT("visibility"),
+			StaticEnum<ESlateVisibility>()->GetNameStringByValue((int64)Widget->GetVisibility()));
+		Entry->SetBoolField(TEXT("hit_testable"),
+			Widget->GetVisibility() == ESlateVisibility::Visible);
+		Entry->SetBoolField(TEXT("enabled"), Widget->GetIsEnabled());
+		// Full object path so Python can resolve the live widget with
+		// unreal.find_object (live trees aren't otherwise reachable from
+		// Python) — e.g. to broadcast a Button's OnClicked.
+		Entry->SetStringField(TEXT("path"), Widget->GetPathName());
+		if (const UTextBlock* Text = Cast<UTextBlock>(Widget))
+		{
+			Entry->SetStringField(TEXT("text"), Text->GetText().ToString());
+		}
+		Out.Add(MakeShared<FJsonValueObject>(Entry));
+
+		if (const UUserWidget* User = Cast<UUserWidget>(Widget))
+		{
+			if (User->WidgetTree)
+			{
+				WalkWidgetTree(User->WidgetTree->RootWidget, Depth + 1, Out, Budget);
+			}
+		}
+		else if (const UPanelWidget* Panel = Cast<UPanelWidget>(Widget))
+		{
+			for (int32 i = 0; i < Panel->GetChildrenCount(); ++i)
+			{
+				WalkWidgetTree(Panel->GetChildAt(i), Depth + 1, Out, Budget);
+			}
+		}
+		else if (const UContentWidget* Content = Cast<UContentWidget>(Widget))
+		{
+			WalkWidgetTree(Content->GetContent(), Depth + 1, Out, Budget);
+		}
+	}
+} // namespace
+
+TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleAttachInteractionRay(
+	const TSharedPtr<FJsonObject>& Params)
+{
+	UWorld* PIE = GEditor ? GEditor->PlayWorld : nullptr;
+	if (!PIE)
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("PIE is not running"));
+	}
+	APlayerController* PC = PIE->GetFirstPlayerController();
+	APawn* Pawn = PC ? PC->GetPawn() : nullptr;
+	if (!Pawn)
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("No player pawn in PIE"));
+	}
+
+	double Distance = 10000.0;
+	if (Params.IsValid() && Params->HasField(TEXT("interaction_distance")))
+	{
+		Distance = Params->GetNumberField(TEXT("interaction_distance"));
+	}
+	bool bPreferExisting = true;
+	if (Params.IsValid() && Params->HasField(TEXT("prefer_existing")))
+	{
+		bPreferExisting = Params->GetBoolField(TEXT("prefer_existing"));
+	}
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+
+	TArray<UWidgetInteractionComponent*> Existing;
+	Pawn->GetComponents(Existing);
+	for (UWidgetInteractionComponent* C : Existing)
+	{
+		if (C->GetFName() == TEXT("MCPHandRay"))
+		{
+			Result->SetBoolField(TEXT("success"), true);
+			Result->SetStringField(TEXT("component"), C->GetName());
+			Result->SetStringField(TEXT("kind"), TEXT("transient"));
+			return Result;
+		}
+	}
+	if (bPreferExisting && Existing.Num() > 0)
+	{
+		// The pawn's real hand-ray (VR) — drive that one.
+		Result->SetBoolField(TEXT("success"), true);
+		Result->SetStringField(TEXT("component"), Existing[0]->GetName());
+		Result->SetStringField(TEXT("kind"), TEXT("pawn"));
+		return Result;
+	}
+
+	UWidgetInteractionComponent* Ray =
+		NewObject<UWidgetInteractionComponent>(Pawn, FName(TEXT("MCPHandRay")));
+	if (!Ray)
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to create ray component"));
+	}
+	Ray->InteractionDistance = static_cast<float>(Distance);
+	Ray->InteractionSource = EWidgetInteractionSource::World;
+	Ray->RegisterComponent();
+	// Runtime-created components don't auto-activate/tick — without these the
+	// interaction never traces (observed live: last hit permanently empty).
+	Ray->Activate(true);
+	Ray->SetComponentTickEnabled(true);
+
+	USceneComponent* Attach = Pawn->FindComponentByClass<UCameraComponent>();
+	if (!Attach)
+	{
+		Attach = Pawn->GetRootComponent();
+	}
+	Ray->AttachToComponent(Attach, FAttachmentTransformRules::SnapToTargetNotIncludingScale);
+
+	Result->SetBoolField(TEXT("success"), true);
+	Result->SetStringField(TEXT("component"), Ray->GetName());
+	Result->SetStringField(TEXT("kind"), TEXT("transient"));
+	Result->SetStringField(TEXT("attached_to"), Attach ? Attach->GetName() : TEXT("none"));
+	return Result;
+}
+
+TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleGetRuntimeWidgetTree(
+	const TSharedPtr<FJsonObject>& Params)
+{
+	UWorld* PIE = GEditor ? GEditor->PlayWorld : nullptr;
+	if (!PIE)
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("PIE is not running"));
+	}
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	int32 Budget = 300;
+
+	FString ActorQuery;
+	if (Params.IsValid())
+	{
+		Params->TryGetStringField(TEXT("actor"), ActorQuery);
+	}
+
+	if (!ActorQuery.IsEmpty())
+	{
+		AActor* A = FindPIEActorByQuery(PIE, ActorQuery);
+		if (!A)
+		{
+			return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+				FString::Printf(TEXT("No PIE actor matches: %s"), *ActorQuery));
+		}
+		Result->SetStringField(TEXT("actor"), A->GetActorLabel());
+
+		TArray<TSharedPtr<FJsonValue>> Comps;
+		TArray<UWidgetComponent*> WidgetComps;
+		A->GetComponents(WidgetComps);
+		for (UWidgetComponent* WC : WidgetComps)
+		{
+			TSharedPtr<FJsonObject> CompObj = MakeShared<FJsonObject>();
+			CompObj->SetStringField(TEXT("component"), WC->GetName());
+			CompObj->SetStringField(TEXT("collision_enabled"),
+				StaticEnum<ECollisionEnabled::Type>()->GetNameStringByValue(
+					(int64)WC->GetCollisionEnabled()));
+			CompObj->SetBoolField(TEXT("blocks_visibility"),
+				WC->GetCollisionResponseToChannel(ECC_Visibility) == ECR_Block);
+			TArray<TSharedPtr<FJsonValue>> Tree;
+			if (UUserWidget* W = Cast<UUserWidget>(WC->GetWidget()))
+			{
+				CompObj->SetStringField(TEXT("widget_class"), W->GetClass()->GetName());
+				WalkWidgetTree(W, 0, Tree, Budget);
+			}
+			CompObj->SetArrayField(TEXT("tree"), Tree);
+			Comps.Add(MakeShared<FJsonValueObject>(CompObj));
+		}
+		Result->SetArrayField(TEXT("widget_components"), Comps);
+	}
+
+	bool bViewport = false;
+	if (Params.IsValid() && Params->HasField(TEXT("include_viewport")))
+	{
+		bViewport = Params->GetBoolField(TEXT("include_viewport"));
+	}
+	if (bViewport || ActorQuery.IsEmpty())
+	{
+		TArray<UUserWidget*> Widgets;
+		UWidgetBlueprintLibrary::GetAllWidgetsOfClass(
+			PIE, Widgets, UUserWidget::StaticClass(), /*TopLevelOnly=*/true);
+		TArray<TSharedPtr<FJsonValue>> ViewportArr;
+		for (UUserWidget* W : Widgets)
+		{
+			TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+			Obj->SetStringField(TEXT("class"), W->GetClass()->GetName());
+			TArray<TSharedPtr<FJsonValue>> Tree;
+			WalkWidgetTree(W, 0, Tree, Budget);
+			Obj->SetArrayField(TEXT("tree"), Tree);
+			ViewportArr.Add(MakeShared<FJsonValueObject>(Obj));
+		}
+		Result->SetArrayField(TEXT("viewport_widgets"), ViewportArr);
+	}
+
+	Result->SetBoolField(TEXT("success"), true);
+	Result->SetBoolField(TEXT("truncated"), Budget <= 0);
+	return Result;
+}
+
+TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleHandRayClick(
+	const TSharedPtr<FJsonObject>& Params)
+{
+	UWorld* PIE = GEditor ? GEditor->PlayWorld : nullptr;
+	if (!PIE)
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("PIE is not running"));
+	}
+	APlayerController* PC = PIE->GetFirstPlayerController();
+	APawn* Pawn = PC ? PC->GetPawn() : nullptr;
+	if (!Pawn)
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("No player pawn in PIE"));
+	}
+
+	FString TargetQuery;
+	if (!Params.IsValid() || !Params->TryGetStringField(TEXT("target"), TargetQuery))
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'target' parameter"));
+	}
+	FString ButtonName = TEXT("LeftMouseButton");
+	if (Params->HasField(TEXT("button")))
+	{
+		ButtonName = Params->GetStringField(TEXT("button"));
+	}
+	double HandDistance = 120.0;
+	if (Params->HasField(TEXT("hand_distance")))
+	{
+		HandDistance = Params->GetNumberField(TEXT("hand_distance"));
+	}
+
+	AActor* Target = FindPIEActorByQuery(PIE, TargetQuery);
+	if (!Target)
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+			FString::Printf(TEXT("No PIE actor matches: %s"), *TargetQuery));
+	}
+
+	// Reuse (or create) the transient ray.
+	UWidgetInteractionComponent* Ray = nullptr;
+	{
+		TArray<UWidgetInteractionComponent*> Existing;
+		Pawn->GetComponents(Existing);
+		for (UWidgetInteractionComponent* C : Existing)
+		{
+			if (C->GetFName() == TEXT("MCPHandRay"))
+			{
+				Ray = C;
+				break;
+			}
+		}
+		if (!Ray)
+		{
+			Ray = NewObject<UWidgetInteractionComponent>(Pawn, FName(TEXT("MCPHandRay")));
+			Ray->InteractionSource = EWidgetInteractionSource::World;
+			Ray->RegisterComponent();
+			USceneComponent* Attach = Pawn->FindComponentByClass<UCameraComponent>();
+			if (!Attach)
+			{
+				Attach = Pawn->GetRootComponent();
+			}
+			Ray->AttachToComponent(Attach, FAttachmentTransformRules::SnapToTargetNotIncludingScale);
+		}
+		Ray->InteractionDistance = 10000.0f;
+		Ray->Activate(true);
+		Ray->SetComponentTickEnabled(true);
+	}
+
+	// Pose like a raised VR hand: just off the widget face along its normal,
+	// firing straight at it (aiming from the pawn's eyes gets blocked by the
+	// target's own mesh).
+	FVector AimPoint = Target->GetActorLocation();
+	FVector FaceNormal = Target->GetActorForwardVector();
+	if (UWidgetComponent* WC = Target->FindComponentByClass<UWidgetComponent>())
+	{
+		AimPoint = WC->GetComponentLocation();
+		FaceNormal = WC->GetForwardVector();
+	}
+	const FVector Hand = AimPoint + FaceNormal * HandDistance;
+	Ray->SetAbsolute(true, true, false);
+	Ray->SetWorldLocationAndRotation(Hand, (AimPoint - Hand).Rotation());
+
+	// Optionally ignore the target's own non-widget primitives for the
+	// duration of the click. Some authored actors fully enclose their
+	// readout in visibility-blocking mesh (the Engine Room pods do — a
+	// player's ray can't reach them either; surface that separately).
+	bool bIgnoreOccluders = false;
+	if (Params->HasField(TEXT("ignore_target_occluders")))
+	{
+		bIgnoreOccluders = Params->GetBoolField(TEXT("ignore_target_occluders"));
+	}
+	TArray<TPair<UPrimitiveComponent*, ECollisionResponse>> SavedResponses;
+	if (bIgnoreOccluders)
+	{
+		TArray<UPrimitiveComponent*> Prims;
+		Target->GetComponents(Prims);
+		for (UPrimitiveComponent* P : Prims)
+		{
+			if (!P->IsA<UWidgetComponent>()
+				&& P->GetCollisionResponseToChannel(ECC_Visibility) == ECR_Block)
+			{
+				SavedResponses.Emplace(P, ECR_Block);
+				P->SetCollisionResponseToChannel(ECC_Visibility, ECR_Ignore);
+			}
+		}
+	}
+
+	// Drive the simulation ourselves — deterministic, no world-tick reliance.
+	Ray->TickComponent(0.016f, LEVELTICK_All, nullptr);
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	UWidgetComponent* Hovered = Ray->GetHoveredWidgetComponent();
+	Result->SetStringField(TEXT("hovered"),
+		Hovered ? Hovered->GetOwner()->GetActorLabel() : TEXT(""));
+	Result->SetBoolField(TEXT("hovered_interactable"), Ray->IsOverInteractableWidget());
+	const FHitResult& Hit = Ray->GetLastHitResult();
+	Result->SetStringField(TEXT("last_hit_actor"),
+		Hit.GetActor() ? Hit.GetActor()->GetActorLabel() : TEXT(""));
+	Result->SetStringField(TEXT("last_hit_component"),
+		Hit.GetComponent() ? Hit.GetComponent()->GetName() : TEXT(""));
+
+	bool bClicked = false;
+	if (Hovered)
+	{
+		Ray->PressPointerKey(FKey(*ButtonName));
+		Ray->TickComponent(0.016f, LEVELTICK_All, nullptr);
+		Ray->ReleasePointerKey(FKey(*ButtonName));
+		bClicked = true;
+	}
+
+	for (const TPair<UPrimitiveComponent*, ECollisionResponse>& Saved : SavedResponses)
+	{
+		if (IsValid(Saved.Key))
+		{
+			Saved.Key->SetCollisionResponseToChannel(ECC_Visibility, Saved.Value);
+		}
+	}
+	Result->SetNumberField(TEXT("occluders_ignored"), SavedResponses.Num());
+
+	Result->SetBoolField(TEXT("clicked"), bClicked);
+	Result->SetStringField(TEXT("target"), Target->GetActorLabel());
 	Result->SetBoolField(TEXT("success"), true);
 	return Result;
 }

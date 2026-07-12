@@ -1035,7 +1035,10 @@ TFuture<FString> UEpicUnrealMCPBridge::DispatchCommandAsync(
 				CommandType == TEXT("capture_from_camera") ||
 				CommandType == TEXT("contact_sheet") ||
 				CommandType == TEXT("get_resource_stats") ||
-				CommandType == TEXT("debug_open_modal"))
+				CommandType == TEXT("debug_open_modal") ||
+				CommandType == TEXT("attach_interaction_ray") ||
+				CommandType == TEXT("get_runtime_widget_tree") ||
+				CommandType == TEXT("hand_ray_click"))
 			{
 				ResultJson = EditorCommands->HandleCommand(CommandType, Params);
 			}

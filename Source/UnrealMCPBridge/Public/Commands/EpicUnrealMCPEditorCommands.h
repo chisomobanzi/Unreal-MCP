@@ -56,4 +56,16 @@ private:
 	// the unattended-mode modal sentinel (the unattended flag cannot suppress
 	// this class of dialog).
 	TSharedPtr<FJsonObject> HandleDebugOpenModal(const TSharedPtr<FJsonObject>& Params);
+
+	// Agent-as-player support (PIE world). Python can drive an existing
+	// WidgetInteractionComponent but cannot create/register one, nor reach a
+	// live UserWidget's WidgetTree — these two fill exactly those gaps.
+	TSharedPtr<FJsonObject> HandleAttachInteractionRay(const TSharedPtr<FJsonObject>& Params);
+	TSharedPtr<FJsonObject> HandleGetRuntimeWidgetTree(const TSharedPtr<FJsonObject>& Params);
+
+	// Full hand-ray click in one command: pose the ray at the target's
+	// widget face, drive the interaction simulation manually (TickComponent
+	// is public), press + release the pointer key. Deterministic — no
+	// dependency on the component being ticked by the world.
+	TSharedPtr<FJsonObject> HandleHandRayClick(const TSharedPtr<FJsonObject>& Params);
 };

@@ -47,6 +47,60 @@ def look_at(x: float = 0.0, y: float = 0.0, z: float = 0.0,
 
 
 @mcp.tool()
+def stand_before(actor: str, distance: float = 250.0) -> str:
+    """Position the pawn in front of an actor's widget face, floor-projected,
+    facing it — the stance a player takes before interacting with a panel."""
+    return json.dumps(_player.stand_before(actor, distance), indent=2)
+
+
+@mcp.tool()
+def hand_ray_select(target: str, button: str = "LeftMouseButton") -> str:
+    """Point the VR-style interaction ray at a target's widget and pull the
+    trigger (press + release the pointer key).
+
+    Drives the same engine pipeline as the VR hand-ray
+    (WidgetInteractionComponent). The ray is posed just off the widget face;
+    if the target's own mesh occludes its widget on the interaction channel,
+    the click is retried with the occluders bypassed and the result carries
+    needed_occluder_bypass: true — that means a REAL player's ray cannot
+    reach this widget: surface it as a project finding.
+    Verify the outcome via get_runtime_state / get_widget_tree, not
+    screenshots.
+    """
+    return json.dumps(_player.hand_ray_select(target, button), indent=2)
+
+
+@mcp.tool()
+def interact(target: str, button_name: str = "") -> str:
+    """Non-VR fallback interaction: directly fire a Button's OnClicked inside
+    the target actor's widget (bypasses hit-testing entirely). Use when you
+    need the gameplay effect regardless of physical reachability."""
+    return json.dumps(_player.interact(target, button_name), indent=2)
+
+
+@mcp.tool()
+def get_runtime_state(actor_filter: str = "", class_filter: str = "",
+                      include_components: bool = False,
+                      include_anim: bool = False, max_actors: int = 40) -> str:
+    """Compact PIE snapshot: actors matching the filters with locations,
+    optional component/animation info, and widget-component hit-testability
+    (collision + blocks-interaction-channel). The primary way to VERIFY
+    interactions and game state — prefer this over screenshots."""
+    return json.dumps(_player.get_runtime_state(
+        actor_filter, class_filter, include_components, include_anim,
+        max_actors), indent=2)
+
+
+@mcp.tool()
+def get_widget_tree_runtime(actor: str = "", include_viewport: bool = False) -> str:
+    """Live widget tree(s) for an actor's widget components (and/or viewport
+    widgets): every widget's name, class, visibility, enabled state, text
+    content, and object path. Assert UI outcomes from this (e.g. 'the detail
+    panel now shows Fluency')."""
+    return json.dumps(_player.get_widget_tree(actor, include_viewport), indent=2)
+
+
+@mcp.tool()
 def teleport_to_room(room: str) -> str:
     """Teleport the pawn to a named room (e.g. "Observatory", "Engine").
 

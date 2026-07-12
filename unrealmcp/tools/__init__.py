@@ -36,6 +36,7 @@ _ALL_MODULES = [
     "debug",
     "niagara",
     "statetree",
+    "player",
 ]
 
 from unrealmcp.tools import core  # noqa: F401 — mandatory

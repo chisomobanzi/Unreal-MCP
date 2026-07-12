@@ -377,6 +377,10 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleGetRuntimeWidgetTree
 
 	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
 	int32 Budget = 300;
+	if (Params.IsValid() && Params->HasField(TEXT("max_widgets")))
+	{
+		Budget = FMath::Clamp((int32)Params->GetNumberField(TEXT("max_widgets")), 10, 5000);
+	}
 
 	FString ActorQuery;
 	if (Params.IsValid())

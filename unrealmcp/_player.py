@@ -443,13 +443,16 @@ result = json.dumps(out)
             "aim": aim, "press": press, "release": release}
 
 
-def get_widget_tree(actor: str = "", include_viewport: bool = False) -> Dict[str, Any]:
+def get_widget_tree(actor: str = "", include_viewport: bool = False,
+                    max_widgets: int = 300) -> Dict[str, Any]:
     """Runtime widget tree(s) with text + hit-testability, via the C++
     get_runtime_widget_tree command (live UserWidget trees aren't reachable
-    from Python)."""
+    from Python). Raise max_widgets for deep UIs — the result reports
+    `truncated: true` when the budget was hit."""
     from unrealmcp._tcp_bridge import _tcp_send_raw
     resp = _tcp_send_raw("get_runtime_widget_tree",
-                         {"actor": actor, "include_viewport": include_viewport})
+                         {"actor": actor, "include_viewport": include_viewport,
+                          "max_widgets": max_widgets})
     if resp.get("status") == "error":
         return {"ok": False, "error": resp.get("error")}
     out = resp.get("result", {})

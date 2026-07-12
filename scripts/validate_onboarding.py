@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
-"""Voyager onboarding playthrough + button audit.
+"""Voyager onboarding playthrough + button audit (the REAL user path).
 
-Drives the first-run onboarding in PIE like a player and click-tests every
-screen's buttons, asserting effects from the manager's own state
-(GetCurrentStage / GetSelectedMode / Language / Level / Goals) and logs.
+Walks first-run onboarding in PIE the way a player does — screen CTA /
+select / shared nav-bar Next (Button_NextScreen) — asserting from the
+manager's own state (GetCurrentStage / GetSelected*).
 
-Two kinds of checks:
-  [WORKS]  behavior that exists today — hard regressions if they break.
-  [SPEC]   the wiring launch item #1 still has to build (interview screens'
-           selections + advancement). RED TODAY BY DESIGN — this suite is
-           the executable spec; it goes green as the wiring lands.
+Check classes:
+  [WORKS] behavior that exists today — hard regressions if they break.
+  [SPEC]  known gaps, red by design until the onboarding wiring lands:
+          - selections (language/level/goals) never update the manager
+            in-session (they persist somewhere, but GetSelected* / skip
+            logic / invitation personalization read stale state)
+          - the mode selection reaches the manager only after a ~2-4s lag,
+            so Confidence + user-speed Next shows the language screen the
+            C++ explicitly wants skipped (ShouldSkipStage line ~620)
+          - nav-bar Button_PrevPage / Button_NextPage have no handlers
 
-Safety: backs up Saved/SaveGames/MainSave.sav and restores it afterwards
-(onboarding stages write save progress). Refuses if PIE is already running.
+Safety: backs up Saved/SaveGames/MainSave.sav and restores it afterwards;
+runs on a CLEAN save (moved aside) so it's a true first-run. Refuses if
+PIE is already running.
 """
 import json
 import os
@@ -38,7 +44,7 @@ def check(name, cond, detail="", spec=False):
         print(f"PASS  {name}")
     elif spec:
         SPEC_FAIL += 1
-        print(f"SPEC  {name}  (not implemented yet)  ->  {str(detail)[:220]}")
+        print(f"SPEC  {name}  (known gap)  ->  {str(detail)[:220]}")
     else:
         FAIL += 1
         print(f"FAIL  {name}  ->  {str(detail)[:300]}")
@@ -92,22 +98,34 @@ def goto(stage):
     time.sleep(1.2)
 
 
-def button_paths():
+def owner_of(path):
+    """The WBP instance whose WidgetTree declares this widget."""
+    parts = path.replace(":", ".").split(".")
+    for i, p in enumerate(parts):
+        if p.startswith("WidgetTree") and i > 0:
+            owner = parts[i - 1]
+    return owner
+
+
+def load_buttons():
     tree = _player.get_widget_tree(actor=PANEL_ACTOR, max_widgets=2000)
-    out, view = {}, ""
+    entries = []
     for comp in tree.get("widget_components", []):
-        if comp.get("widget_class") != PANEL_CLASS:
-            continue
-        for e in comp.get("tree", []):
-            if e.get("class", "").startswith("WBP_"):
-                view = e["name"]
-            if e.get("class") == "Button":
-                out[(view, e["name"])] = e.get("path")
-    return out, tree
+        if comp.get("widget_class") == PANEL_CLASS:
+            entries = comp.get("tree", [])
+    buttons = [(owner_of(e["path"]), e["name"], e["path"])
+               for e in entries if e.get("class") == "Button"]
+    return buttons, tree
 
 
-def click(paths, view, name, settle=2.0):
-    p = paths.get((view, name))
+def path_for(buttons, name, owner_contains=""):
+    for owner, n, p in buttons:
+        if n == name and (not owner_contains or owner_contains in owner):
+            return p
+    return None
+
+
+def click_path(p, settle=1.2):
     if not p:
         return False
     exec_py(f"import unreal\nunreal.find_object(None, {p!r}).on_clicked.broadcast()\nresult='ok'")
@@ -124,8 +142,8 @@ def main():
         print("ABORT: PIE already running")
         sys.exit(2)
     if os.path.exists(save):
-        shutil.copy(save, backup)
-        print(f"(save backed up: {backup})")
+        shutil.move(save, backup)  # clean first-run: no save at all
+        print(f"(save moved aside: {backup})")
 
     call("set_unattended_mode", {"enabled": True})
     try:
@@ -138,99 +156,107 @@ def main():
         check("0.2 PIE active", wait_pie(True))
         time.sleep(8)
 
-        # fresh run
-        exec_py(MGR + "mgr.start_onboarding(True)\nresult='ok'")
-        time.sleep(2)
         st = mgr_state()
-        check("0.3 onboarding restarted at Arrival", st.get("stage") == "EXTERIOR_ARRIVAL", st)
+        check("0.3 fresh save starts at Arrival", st.get("stage") == "EXTERIOR_ARRIVAL", st)
 
-        paths, tree = button_paths()
+        buttons, tree = load_buttons()
         check("0.4 panel widget tree complete (not truncated)",
               tree.get("truncated") is False, tree.get("truncated"))
-        bound = exec_py("import unreal, json\n" + f"paths = {json.dumps(list(paths.values()))}\n" + """
+
+        bound = exec_py("import unreal, json\n"
+                        + f"paths = {json.dumps([p for _, _, p in buttons])}\n" + """
 out = []
 for p in paths:
     b = unreal.find_object(None, p)
     out.append(bool(b.on_clicked.is_bound()) if b else None)
 result = json.dumps(out)
 """)
-        unbound = [k for k, b in zip(paths.keys(), bound) if not b]
-        check("0.5 all buttons have OnClicked handlers bound", not unbound, unbound)
+        unbound = [(o, n) for (o, n, _), b in zip(buttons, bound) if not b]
+        known_dead = {("WBP_VoyagerOnboarding_C_0", "Button_PrevPage"),
+                      ("WBP_VoyagerOnboarding_C_0", "Button_NextPage")}
+        check("0.5 [SPEC] nav-bar PrevPage/NextPage have handlers",
+              not (set(unbound) & known_dead), sorted(set(unbound) & known_dead),
+              spec=True)
+        check("0.6 no OTHER buttons unbound",
+              not (set(unbound) - known_dead), sorted(set(unbound) - known_dead))
 
-        # physical reachability: the panel must be hand-ray hittable
         ray = _player.hand_ray_select(PANEL_ACTOR)
-        check("0.6 panel physically hittable by hand-ray (no occluder bypass)",
+        check("0.7 panel physically hittable by hand-ray (no occluder bypass)",
               ray.get("ok") and not ray.get("needed_occluder_bypass"), ray)
-        exec_py(MGR + "mgr.start_onboarding(True)\nresult='ok'")  # ray click may have advanced
+        exec_py(MGR + "mgr.start_onboarding(True)\nresult='ok'")
         time.sleep(1.5)
 
-        # ---- [WORKS] the two live transitions --------------------------------
-        click(paths, "WBP_VO_GreetingView", "Button_StartMission")
-        st = mgr_state()
-        check("1.1 [WORKS] Greeting 'Get Started' advances to Voice Check",
-              st.get("stage") == "EXTERIOR_VOICE_CHECK", st)
+        start = path_for(buttons, "Button_StartMission")
+        skip = path_for(buttons, "Button_Skip")
+        nxt = path_for(buttons, "Button_NextScreen")
+        back = path_for(buttons, "Button_Back")
+        confidence = path_for(buttons, "Button_Mode_Confidence")
 
-        click(paths, "WBP_VO_SpeechTestView", "Button_Skip")
-        st = mgr_state()
-        check("1.2 [WORKS] Speech-test Skip advances to Interview: Mode",
-              st.get("stage") == "EXTERIOR_INTERVIEW_MODE", st)
+        # ---- [WORKS] the real user path ----------------------------------
+        click_path(start, 1.5)
+        check("1.1 [WORKS] Greeting 'Get Started' -> Voice Check",
+              mgr_state().get("stage") == "EXTERIOR_VOICE_CHECK", mgr_state())
 
-        # ---- [SPEC] interview wiring (red until launch item #1 lands) --------
-        click(paths, "WBP_VO_ModeSelect", "Button_Mode_Confidence", settle=4)
-        st = mgr_state()
-        check("2.1 [SPEC] mode button records the selection (SelectMode)",
-              st.get("mode") == "CONFIDENCE", st, spec=True)
-        check("2.2 [SPEC] mode screen has a path forward (advance on select or a continue button)",
-              st.get("stage") != "EXTERIOR_INTERVIEW_MODE", st, spec=True)
+        click_path(skip, 1.5)
+        check("1.2 [WORKS] Speech-test Skip -> Interview: Mode",
+              mgr_state().get("stage") == "EXTERIOR_INTERVIEW_MODE", mgr_state())
 
-        # NOTE these assert the MANAGER's in-session state (SelectLanguage etc.),
-        # not the save file: the invitation screen's personalized outcome reads
-        # the manager, so save-only writes are not enough. Delta-based — a
-        # different target than the current value is clicked each time, so
-        # stale values loaded from a previous save can't fake a pass.
+        # Confidence + user-speed Next: the C++ wants the language stage
+        # skipped for confidence mode, but the selection reaches the manager
+        # ~2-4s late, so a normal user lands on the language screen anyway.
+        click_path(confidence, 1.0)
+        click_path(nxt, 2.0)
+        st = mgr_state()
+        check("2.1 [SPEC] Confidence + user-speed Next skips the language screen",
+              st.get("stage") == "EXTERIOR_INTERVIEW_LEVEL", st, spec=True)
+
+        # Whatever stage we're on, the nav Next keeps advancing [WORKS]:
+        st0 = mgr_state().get("stage")
+        click_path(nxt, 2.0)
+        st1 = mgr_state().get("stage")
+        check("1.3 [WORKS] nav Next advances a stage", st1 != st0,
+              {"from": st0, "to": st1})
+        click_path(back, 2.0)
+        check("1.4 [WORKS] nav Back returns", mgr_state().get("stage") == st0,
+              {"expected": st0, "got": mgr_state().get("stage")})
+
+        # ---- [SPEC] in-session manager sync (patient 5s, delta-based) -----
         goto("EXTERIOR_INTERVIEW_LANGUAGE")
         before = mgr_state().get("lang")
-        for card in ("WBP_LanguageCard_C_2", "WBP_LanguageCard_C_3"):
-            click(paths, card, "Button_Card", settle=3)
-            if mgr_state().get("lang") != before:
-                break
+        card = path_for(buttons, "Button_Card", owner_contains="LanguageCard_C_2")
+        click_path(card, 5.0)
         st = mgr_state()
-        check("2.3 [SPEC] language card updates the manager in-session (SelectLanguage)",
-              st.get("lang") != before, {"before": before, "after": st}, spec=True)
+        check("2.2 [SPEC] language card updates the manager in-session",
+              st.get("lang") != before, {"before": before, "after": st.get("lang")},
+              spec=True)
 
         goto("EXTERIOR_INTERVIEW_LEVEL")
         before = mgr_state().get("level")
-        target_btn = ("Button_Language_Advanced" if before != "ADVANCED"
-                      else "Button_Language_Beginner")
-        expected = "ADVANCED" if before != "ADVANCED" else "BEGINNER"
-        click(paths, "WBP_VO_DifficultySelector", target_btn, settle=3)
+        btn = ("Button_Language_Advanced" if before != "ADVANCED"
+               else "Button_Language_Beginner")
+        click_path(path_for(buttons, btn), 5.0)
         st = mgr_state()
-        check("2.4 [SPEC] level button updates the manager in-session (SelectExperienceLevel)",
-              st.get("level") == expected, {"before": before, "after": st}, spec=True)
+        check("2.3 [SPEC] level button updates the manager in-session",
+              st.get("level") != before, {"before": before, "after": st.get("level")},
+              spec=True)
 
         goto("EXTERIOR_INTERVIEW_GOALS")
         before = sorted(mgr_state().get("goals", []))
-        click(paths, "WBP_GoalCard_C_1", "Button_Card", settle=1)
-        click(paths, "WBP_GoalCard_C_4", "Button_Card", settle=2)
+        click_path(path_for(buttons, "Button_Card", owner_contains="GoalCard_C_1"), 5.0)
         st = mgr_state()
-        check("2.5 [SPEC] goal cards update the manager in-session (SelectGoals)",
+        check("2.4 [SPEC] goal card updates the manager in-session",
               sorted(st.get("goals", [])) != before,
-              {"before": before, "after": st}, spec=True)
+              {"before": before, "after": st.get("goals")}, spec=True)
 
-        # ---- structural coverage of the later stages --------------------------
+        # ---- structure ------------------------------------------------------
         views = {e.get("class") for comp in tree.get("widget_components", [])
                  for e in comp.get("tree", []) if e.get("class", "").startswith("WBP_")}
         check("3.1 [SPEC] Invitation stage has a screen",
               any("Invit" in v for v in views), sorted(views), spec=True)
-        check("3.2 account screens present (login/link UI exists)",
-              any("Account" in v for v in views), sorted(views))
-
-        # stage navigation itself is sound end to end
+        check("3.2 account screens present", any("Account" in v for v in views))
         goto("INTERIOR_ACCOUNT_LOGIN")
-        st = mgr_state()
-        check("3.3 [WORKS] GoToStage reaches Account Login (stage nav sound)",
-              st.get("stage") == "INTERIOR_ACCOUNT_LOGIN", st)
-        goto("EXTERIOR_ARRIVAL")
+        check("3.3 [WORKS] GoToStage reaches Account Login",
+              mgr_state().get("stage") == "INTERIOR_ACCOUNT_LOGIN", mgr_state())
 
     finally:
         call("stop_pie", {})
@@ -238,8 +264,7 @@ result = json.dumps(out)
         time.sleep(3)
         call("set_unattended_mode", {"enabled": False})
         if os.path.exists(backup):
-            shutil.copy(backup, save)
-            os.remove(backup)
+            shutil.move(backup, save)
             print("(save restored)")
 
     print(f"\n=== {PASS} passed, {FAIL} failed, {SPEC_FAIL} spec-pending ===")

@@ -136,14 +136,13 @@ result = "issued"
         check("4.2 ray hovered the pod's widget at press",
               bool(hovered) and target.lower() in str(hovered).lower(),
               sel)
-        if sel.get("needed_occluder_bypass"):
-            # Harness capability proven, but a PLAYER's ray cannot reach the
-            # readout: the pod's own mesh (BlockAll/BlockAllDynamic) encloses
-            # the widget on the interaction channel. Project bug, not a
-            # harness failure — surfaced for Chisomo.
-            print("      WARN  project finding: pod readout is fully occluded by its "
-                  "own mesh on ECC_Visibility — a real VR ray cannot click it "
-                  f"(occluders bypassed: {sel.get('occluders_ignored')})")
+        # A real player's ray must reach the readout WITHOUT the harness
+        # bypassing the pod's own mesh — this is the player-experience
+        # contract (EngineRoomManager makes the enclosure ignore the
+        # interaction channel).
+        check("4.2b pod naturally reachable (no occluder bypass needed)",
+              not sel.get("needed_occluder_bypass"),
+              {"occluders_bypassed": sel.get("occluders_ignored")})
         time.sleep(1.5)
         clicks = log_since(log_path, off, "pod-click -> detail")
         check("4.3 pod click reached ShowPodDetail (analytics log)",

@@ -253,10 +253,32 @@ def add_material_expression(material_path: str, node: str) -> str:
 
     For Custom HLSL nodes, include top-level "code", "description", "output_type",
     "inputs", and "outputs" fields.
+
+    Shorthand: for a node with no extra properties you may pass just the type name,
+    e.g. node="OneMinus" (equivalent to node='{"type": "OneMinus"}').
     """
+    try:
+        node_obj = json.loads(node)
+    except (json.JSONDecodeError, TypeError):
+        # Forgiving shorthand: a bare type name like "OneMinus" -> {"type": "OneMinus"}.
+        stripped = (node or "").strip()
+        if stripped and all(c.isalnum() or c == "_" for c in stripped):
+            node_obj = {"type": stripped}
+        else:
+            return json.dumps({"status": "error", "error": (
+                '`node` must be a JSON object string like {"type": "OneMinus", "pos_x": 0, '
+                '"pos_y": 0}, or just a bare type name like "OneMinus". '
+                f"Could not parse: {node!r}"
+            )})
+
+    if not isinstance(node_obj, dict) or "type" not in node_obj:
+        return json.dumps({"status": "error", "error": (
+            '`node` must be a JSON object with a "type" field, e.g. {"type": "ScalarParameter"}.'
+        )})
+
     return _call("add_material_expression", {
         "material_path": material_path,
-        "node": json.loads(node),
+        "node": node_obj,
     })
 
 

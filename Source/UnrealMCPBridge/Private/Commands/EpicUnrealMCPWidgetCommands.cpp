@@ -1196,8 +1196,16 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPWidgetCommands::HandleScreenshotWidget(
 	DrawSize.X = FMath::Clamp(DrawSize.X, 8.0, 8192.0);
 	DrawSize.Y = FMath::Clamp(DrawSize.Y, 8.0, 8192.0);
 
+	// Gamma: render in Slate's gamma space (its shader already emits display-sRGB
+	// bytes) but store into a LINEAR target. The engine's usual pairing sends the
+	// same bool to both args, which is right for a target that is later SAMPLED
+	// through an sRGB decode (in-engine display) — but this tool does a raw
+	// ReadPixels straight to PNG, skipping that decode. With an sRGB target the
+	// RHI re-encodes on store, so ReadPixels returns sRGB(sRGB(x)) and every colour
+	// lands ~one stop too bright (authored navy read back as bright teal). A linear
+	// target keeps the shader's sRGB bytes raw, so the PNG matches the authored look.
 	FWidgetRenderer* Renderer = new FWidgetRenderer(/*bUseGammaSpace*/ true);
-	UTextureRenderTarget2D* RenderTarget = FWidgetRenderer::CreateTargetFor(DrawSize, TF_Bilinear, /*bUseGammaCorrection*/ true);
+	UTextureRenderTarget2D* RenderTarget = FWidgetRenderer::CreateTargetFor(DrawSize, TF_Bilinear, /*bUseGammaCorrection*/ false);
 	if (!RenderTarget)
 	{
 		delete Renderer;

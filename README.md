@@ -444,7 +444,7 @@ The script asks where to create the MCP config:
 | Category | Count | Highlights |
 |----------|------:|-----------|
 | [Core](#core-2) | 9 | health_check, execute_python, **reliability layer**: set_unattended_mode, get_editor_state/recover_editor (crash watchdog), run_batch (crash-resumable), get_bridge_events, get_resource_stats |
-| Playtest / Player | 10 | agent-as-player: get_pawn_state, move_to/teleport_to_room/stand_before (navmesh-safe), hand_ray_select (simulated VR ray), interact, get_runtime_state, get_widget_tree_runtime, playthrough(flow) |
+| Playtest / Player | 10 | agent-as-player: get_pawn_state, move_to/teleport_to_room/stand_before (navmesh-safe), hand_ray_select (simulated VR ray, aimable at a named sub-widget), interact, get_runtime_state, get_widget_tree_runtime, playthrough(flow) |
 | [Asset Management](#asset-management-16) | 16 | find/list/import/duplicate/rename/delete/save |
 | [Blueprints](#blueprints-22) | 22 | create, compile, variables, functions, graph nodes |
 | [Materials](#materials-35) | 35 | create, build_material_graph, material functions, Substrate |

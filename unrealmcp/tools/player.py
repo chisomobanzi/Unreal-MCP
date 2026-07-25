@@ -54,7 +54,8 @@ def stand_before(actor: str, distance: float = 250.0) -> str:
 
 
 @mcp.tool()
-def hand_ray_select(target: str, button: str = "LeftMouseButton") -> str:
+def hand_ray_select(target: str, button: str = "LeftMouseButton",
+                    widget: str = "", widget_component: str = "") -> str:
     """Point the VR-style interaction ray at a target's widget and pull the
     trigger (press + release the pointer key).
 
@@ -64,10 +65,20 @@ def hand_ray_select(target: str, button: str = "LeftMouseButton") -> str:
     the click is retried with the occluders bypassed and the result carries
     needed_occluder_bypass: true — that means a REAL player's ray cannot
     reach this widget: surface it as a project finding.
+
+    widget: name a CHILD widget ("Btn_Confirm") to press that button rather
+    than whatever sits at the panel's centre. Names come from
+    get_widget_tree_runtime. The result reports hit_local_px / widget_rect_px
+    and hit_inside_widget — a click that lands on the panel but outside the
+    named widget is reported as NOT ok, never as a pass.
+    widget_component: disambiguator when the actor has several widget
+    components.
+
     Verify the outcome via get_runtime_state / get_widget_tree, not
     screenshots.
     """
-    return json.dumps(_player.hand_ray_select(target, button), indent=2)
+    return json.dumps(
+        _player.hand_ray_select(target, button, widget, widget_component), indent=2)
 
 
 @mcp.tool()

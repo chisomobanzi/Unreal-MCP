@@ -314,7 +314,8 @@ result = json.dumps(out)
 ''')
 
 
-def hand_ray_select(target: str, button: str = "LeftMouseButton") -> Dict[str, Any]:
+def hand_ray_select(target: str, button: str = "LeftMouseButton",
+                    widget: str = "", widget_component: str = "") -> Dict[str, Any]:
     """Point the widget-interaction ray at `target` and pull the trigger.
 
     Backed by the C++ hand_ray_click command: the ray is posed like a raised
@@ -322,23 +323,41 @@ def hand_ray_select(target: str, button: str = "LeftMouseButton") -> Dict[str, A
     blocked by the target's own mesh), the interaction simulation is driven
     deterministically, and the pointer key is pressed + released — the same
     engine pipeline (WidgetInteractionComponent) the real VR hand-ray uses.
+
+    `widget` names a CHILD widget to aim at ("Btn_Confirm") instead of the
+    panel's centre — the ray lands on that widget's own rect, so a panel with
+    five buttons is five distinct targets. `widget_component` disambiguates
+    when the actor carries more than one widget component.
     """
     from unrealmcp._tcp_bridge import _tcp_send_raw
-    resp = _tcp_send_raw("hand_ray_click", {"target": target, "button": button})
+
+    params = {"target": target, "button": button}
+    if widget:
+        params["widget"] = widget
+    if widget_component:
+        params["widget_component"] = widget_component
+
+    def _finish(result: Dict[str, Any]) -> Dict[str, Any]:
+        # Landing on the panel but missing the named button is a MISS. Calling
+        # that a pass is exactly how centre-aim used to "click" the wrong thing.
+        hit_the_ask = bool(result.get("hit_inside_widget")) if widget else True
+        result["ok"] = (bool(result.get("success")) and bool(result.get("clicked"))
+                        and hit_the_ask)
+        return result
+
+    resp = _tcp_send_raw("hand_ray_click", params)
     if resp.get("status") == "error":
         return {"ok": False, "error": resp.get("error")}
-    out = resp.get("result", {})
-    out["ok"] = bool(out.get("success")) and bool(out.get("clicked"))
+    out = _finish(resp.get("result", {}))
     if not out["ok"] and not out.get("hovered"):
         # No line of sight — retry pressing "through" the target's own
         # occluding mesh (some authored actors enclose their readouts;
-        # report it so the project issue is visible).
+        # report it so the project issue is visible). Same aim, so the retry
+        # can't quietly drift back to the panel centre.
         resp = _tcp_send_raw("hand_ray_click",
-                             {"target": target, "button": button,
-                              "ignore_target_occluders": True})
+                             {**params, "ignore_target_occluders": True})
         if resp.get("status") != "error":
-            out = resp.get("result", {})
-            out["ok"] = bool(out.get("success")) and bool(out.get("clicked"))
+            out = _finish(resp.get("result", {}))
             out["needed_occluder_bypass"] = True
     return out
 

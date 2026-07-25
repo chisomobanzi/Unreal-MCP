@@ -450,6 +450,107 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleGetRuntimeWidgetTree
 	return Result;
 }
 
+namespace HandRayAim
+{
+	/** Depth-first search for a named widget inside a live widget component,
+	 *  diving into nested user widgets (an embedded WBP has its own tree).
+	 *  Exact name wins; a substring match is the fallback. */
+	static UWidget* FindSubWidget(UUserWidget* Root, const FString& Name)
+	{
+		if (!Root || !Root->WidgetTree || Name.IsEmpty())
+		{
+			return nullptr;
+		}
+		UWidget* Exact = nullptr;
+		UWidget* Loose = nullptr;
+		Root->WidgetTree->ForEachWidgetAndDescendants([&](UWidget* W)
+		{
+			if (!W || Exact)
+			{
+				return;
+			}
+			const FString WName = W->GetName();
+			if (WName.Equals(Name, ESearchCase::IgnoreCase))
+			{
+				Exact = W;
+			}
+			else if (!Loose && WName.Contains(Name))
+			{
+				Loose = W;
+			}
+		});
+		return Exact ? Exact : Loose;
+	}
+
+	/** A sub-widget's rect in the SAME space UWidgetComponent::GetLocalHitLocation
+	 *  outputs (widget-space pixels). Derived by normalising the child's cached
+	 *  Slate geometry against the root's, so it is immune to whatever DPI or
+	 *  content scale the virtual window happens to be running at. */
+	static bool GetSubWidgetLocalRect(UWidgetComponent* WC, UWidget* Sub,
+		FVector2D& OutMin, FVector2D& OutSize)
+	{
+		UUserWidget* RootUW = WC ? WC->GetUserWidgetObject() : nullptr;
+		if (!RootUW || !Sub)
+		{
+			return false;
+		}
+		const FGeometry& RootGeo = RootUW->GetCachedGeometry();
+		const FGeometry& SubGeo = Sub->GetCachedGeometry();
+		const FVector2D RootPos = RootGeo.GetAbsolutePosition();
+		const FVector2D RootSize = RootGeo.GetAbsoluteSize();
+		const FVector2D SubSize = SubGeo.GetAbsoluteSize();
+		if (RootSize.X <= KINDA_SMALL_NUMBER || RootSize.Y <= KINDA_SMALL_NUMBER
+			|| SubSize.X <= KINDA_SMALL_NUMBER || SubSize.Y <= KINDA_SMALL_NUMBER)
+		{
+			return false; // never laid out (collapsed, or the widget hasn't ticked yet)
+		}
+		const FVector2D SubPos = SubGeo.GetAbsolutePosition();
+		const FVector2D Draw = WC->GetCurrentDrawSize();
+		OutMin = (SubPos - RootPos) / RootSize * Draw;
+		OutSize = SubSize / RootSize * Draw;
+		return true;
+	}
+
+	/** The world point on the widget's plane that maps to the given widget-space
+	 *  pixel. Solved by probing the component's OWN forward mapping at three
+	 *  points and inverting the 2x2 — so it stays correct whatever axis flip or
+	 *  pivot convention GetLocalHitLocation uses, this engine version or the next. */
+	static bool SolveWorldPointForLocal(UWidgetComponent* WC,
+		const FVector2D& TargetLocal, FVector& OutWorld)
+	{
+		const FVector C = WC->GetComponentLocation();
+		const FVector R = WC->GetRightVector();
+		const FVector U = WC->GetUpVector();
+		constexpr double Probe = 10.0;
+
+		FVector2D L0, LR, LU;
+		WC->GetLocalHitLocation(C, L0);
+		WC->GetLocalHitLocation(C + R * Probe, LR);
+		WC->GetLocalHitLocation(C + U * Probe, LU);
+
+		const FVector2D dR = (LR - L0) / Probe;
+		const FVector2D dU = (LU - L0) / Probe;
+		const double Det = dR.X * dU.Y - dU.X * dR.Y;
+		if (FMath::IsNearlyZero(Det))
+		{
+			return false; // degenerate mapping — fall back to centre aim
+		}
+		const FVector2D T = TargetLocal - L0;
+		const double A = (T.X * dU.Y - dU.X * T.Y) / Det;
+		const double B = (dR.X * T.Y - T.X * dR.Y) / Det;
+		OutWorld = C + R * A + U * B;
+		return true;
+	}
+
+	static TSharedPtr<FJsonObject> Vec2Json(const FVector2D& V)
+	{
+		TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+		Obj->SetNumberField(TEXT("x"), V.X);
+		Obj->SetNumberField(TEXT("y"), V.Y);
+		return Obj;
+	}
+}
+
 TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleHandRayClick(
 	const TSharedPtr<FJsonObject>& Params)
 {
@@ -518,16 +619,98 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleHandRayClick(
 		Ray->SetComponentTickEnabled(true);
 	}
 
+	// Optionally aim at a NAMED child widget instead of the panel's centre —
+	// a five-button panel is five distinct targets, not one.
+	FString SubWidgetName, WidgetComponentName;
+	Params->TryGetStringField(TEXT("widget"), SubWidgetName);
+	Params->TryGetStringField(TEXT("widget_component"), WidgetComponentName);
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+
 	// Pose like a raised VR hand: just off the widget face along its normal,
 	// firing straight at it (aiming from the pawn's eyes gets blocked by the
 	// target's own mesh).
 	FVector AimPoint = Target->GetActorLocation();
 	FVector FaceNormal = Target->GetActorForwardVector();
-	if (UWidgetComponent* WC = Target->FindComponentByClass<UWidgetComponent>())
+
+	// Pick the widget component: the one carrying the named child if we're
+	// looking for one, otherwise (as before) the actor's first.
+	TArray<UWidgetComponent*> WidgetComps;
+	Target->GetComponents(WidgetComps);
+	UWidgetComponent* AimComp = nullptr;
+	UWidget* SubWidget = nullptr;
+	for (UWidgetComponent* WC : WidgetComps)
 	{
-		AimPoint = WC->GetComponentLocation();
-		FaceNormal = WC->GetForwardVector();
+		if (!WC || (!WidgetComponentName.IsEmpty()
+			&& !WC->GetName().Contains(WidgetComponentName)))
+		{
+			continue;
+		}
+		if (!AimComp)
+		{
+			AimComp = WC;
+		}
+		if (!SubWidgetName.IsEmpty())
+		{
+			if (UWidget* Found = HandRayAim::FindSubWidget(WC->GetUserWidgetObject(), SubWidgetName))
+			{
+				AimComp = WC;
+				SubWidget = Found;
+				break;
+			}
+		}
 	}
+	if (AimComp)
+	{
+		AimPoint = AimComp->GetComponentLocation();
+		FaceNormal = AimComp->GetForwardVector();
+	}
+
+	FVector2D RectMin = FVector2D::ZeroVector;
+	FVector2D RectSize = FVector2D::ZeroVector;
+	bool bAimedAtSubWidget = false;
+	if (!SubWidgetName.IsEmpty())
+	{
+		if (!SubWidget)
+		{
+			return FEpicUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(
+				TEXT("Actor '%s' has no live widget named '%s' (use get_widget_tree_runtime "
+					 "to list what is actually there)"), *Target->GetActorLabel(), *SubWidgetName));
+		}
+		Result->SetStringField(TEXT("aimed_widget"), SubWidget->GetName());
+		Result->SetStringField(TEXT("aimed_widget_class"), SubWidget->GetClass()->GetName());
+		Result->SetStringField(TEXT("aimed_widget_visibility"),
+			StaticEnum<ESlateVisibility>()->GetNameStringByValue(
+				(int64)SubWidget->GetVisibility()));
+		Result->SetStringField(TEXT("widget_component"), AimComp->GetName());
+		Result->SetStringField(TEXT("geometry_mode"),
+			StaticEnum<EWidgetGeometryMode>()->GetNameStringByValue(
+				(int64)AimComp->GetGeometryMode()));
+
+		FVector Solved;
+		if (HandRayAim::GetSubWidgetLocalRect(AimComp, SubWidget, RectMin, RectSize)
+			&& HandRayAim::SolveWorldPointForLocal(AimComp, RectMin + RectSize * 0.5, Solved))
+		{
+			AimPoint = Solved;
+			bAimedAtSubWidget = true;
+			Result->SetObjectField(TEXT("widget_rect_px"), HandRayAim::Vec2Json(RectMin));
+			Result->SetObjectField(TEXT("widget_size_px"), HandRayAim::Vec2Json(RectSize));
+			// Round-trip through the engine's own forward mapping: if this isn't
+			// ~0 the aim solve is wrong, and the caller should not trust the click.
+			FVector2D Back;
+			AimComp->GetLocalHitLocation(Solved, Back);
+			Result->SetNumberField(TEXT("aim_roundtrip_error_px"),
+				(Back - (RectMin + RectSize * 0.5)).Size());
+		}
+		else
+		{
+			Result->SetStringField(TEXT("aim_warning"),
+				TEXT("widget has no laid-out geometry (collapsed, or not ticked yet) — "
+					 "fell back to the panel centre"));
+		}
+	}
+	Result->SetBoolField(TEXT("aimed_at_sub_widget"), bAimedAtSubWidget);
+
 	const FVector Hand = AimPoint + FaceNormal * HandDistance;
 	Ray->SetAbsolute(true, true, false);
 	Ray->SetWorldLocationAndRotation(Hand, (AimPoint - Hand).Rotation());
@@ -560,7 +743,6 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleHandRayClick(
 	// Drive the simulation ourselves — deterministic, no world-tick reliance.
 	Ray->TickComponent(0.016f, LEVELTICK_All, nullptr);
 
-	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
 	UWidgetComponent* Hovered = Ray->GetHoveredWidgetComponent();
 	Result->SetStringField(TEXT("hovered"),
 		Hovered ? Hovered->GetOwner()->GetActorLabel() : TEXT(""));
@@ -570,6 +752,23 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleHandRayClick(
 		Hit.GetActor() ? Hit.GetActor()->GetActorLabel() : TEXT(""));
 	Result->SetStringField(TEXT("last_hit_component"),
 		Hit.GetComponent() ? Hit.GetComponent()->GetName() : TEXT(""));
+
+	// Where the ray ACTUALLY landed in widget space, and whether that is inside
+	// the rect we were asked for. Hitting the panel but missing the button is a
+	// miss — reporting it as a click is the bug this whole change exists to kill.
+	if (bAimedAtSubWidget && Hovered == AimComp)
+	{
+		FVector2D HitLocal;
+		AimComp->GetLocalHitLocation(Hit.ImpactPoint, HitLocal);
+		Result->SetObjectField(TEXT("hit_local_px"), HandRayAim::Vec2Json(HitLocal));
+		Result->SetBoolField(TEXT("hit_inside_widget"),
+			HitLocal.X >= RectMin.X && HitLocal.X <= RectMin.X + RectSize.X
+			&& HitLocal.Y >= RectMin.Y && HitLocal.Y <= RectMin.Y + RectSize.Y);
+	}
+	else if (bAimedAtSubWidget)
+	{
+		Result->SetBoolField(TEXT("hit_inside_widget"), false);
+	}
 
 	bool bClicked = false;
 	if (Hovered)

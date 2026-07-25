@@ -24,14 +24,25 @@ assert the outcome — unattended. Design + findings: `docs/PLAYTEST-HARNESS-DES
    the raise-the-pawn-half-a-body bug even with a wrong Z.
 3. Interact: `hand_ray_select(target)` — poses the interaction ray like a raised VR
    hand at the target's widget face and pulls the trigger (real
-   WidgetInteractionComponent pipeline). Non-VR fallback: `interact(target)`
-   broadcasts a Button's OnClicked directly (bypasses hit-testing).
+   WidgetInteractionComponent pipeline). Add `widget="Btn_Confirm"` to press a
+   NAMED child rather than whatever sits at the panel's centre — a five-button
+   panel is five targets. Names come from `get_widget_tree_runtime`. Non-VR
+   fallback: `interact(target)` broadcasts a Button's OnClicked directly
+   (bypasses hit-testing).
 4. **Verify from state, not screenshots**: `get_pawn_state()`,
    `get_runtime_state(actor_filter=...)` (locations + widget hit-testability),
    `get_widget_tree_runtime(actor=...)` (live widget tree with text — assert
    "the panel now shows Fluency"). Screenshots are for humans; state is for asserts.
 5. `stop_pie()` and verify it stopped before map switches (then `obj gc` + settle —
    switching maps with PIE teardown in flight has crashed the editor).
+
+### Red flag: `hit_inside_widget: false`
+You named a widget, the ray hit the panel, and it landed OUTSIDE that widget's rect.
+`ok` is false and the click is a miss — do not treat it as a pass. Usually the widget
+was mid-animation or re-laid-out between the tree read and the press; re-read
+`get_widget_tree_runtime` and try again. `aim_roundtrip_error_px` well above 0 means
+something stranger: the component's own coordinate mapping didn't invert, so the aim
+is not trustworthy at all.
 
 ### Red flag: `needed_occluder_bypass: true`
 `hand_ray_select` retried by making the target's own mesh ignore the trace. The click
@@ -46,7 +57,8 @@ blocking mesh). That's a project bug — surface it, don't paper over it
   {"action": "load_map", "args": {"map": "/Game/..."}},
   {"action": "start_pie", "args": {"settle": 6}},
   {"action": "teleport_to_room", "args": {"room": "Engine"}},
-  {"action": "hand_ray_select", "args": {"target": "BP_SkillPod_Fluency"}},
+  {"action": "hand_ray_select", "args": {"target": "BP_SkillPod_Fluency",
+                                         "widget": "Button_Base"}},
   {"action": "assert_state", "args": {"log_contains": "pod-click -> detail"}},
   {"action": "assert_state", "args": {"widget_text_contains":
       {"actor": "BP_EngineRoomHub", "text": "Fluency"}}},

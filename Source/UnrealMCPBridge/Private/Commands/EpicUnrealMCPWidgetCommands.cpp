@@ -15,6 +15,8 @@
 #include "EditorAssetLibrary.h"
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "UObject/UObjectIterator.h"
+#include "Serialization/ObjectWriter.h"
+#include "Serialization/ObjectReader.h"
 #include "JsonObjectConverter.h"
 #include "UObject/EnumProperty.h"
 
@@ -673,6 +675,113 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPWidgetCommands::HandleRenameWidget(
 // ===========================================================================
 // duplicate_widget
 // ===========================================================================
+namespace
+{
+/** A name no object already owns inside the tree — widgets and slots share that outer. */
+FName MakeUniqueWidgetName(UWidgetTree* Tree, FName Desired)
+{
+	if (!StaticFindObjectFast(UObject::StaticClass(), Tree, Desired))
+	{
+		return Desired;
+	}
+	const FString Base = Desired.ToString();
+	for (int32 Counter = 0; ; ++Counter)
+	{
+		const FName Candidate(*FString::Printf(TEXT("%s_Dup%d"), *Base, Counter));
+		if (!StaticFindObjectFast(UObject::StaticClass(), Tree, Candidate))
+		{
+			return Candidate;
+		}
+	}
+}
+
+/**
+ * Copy a widget and everything below it into `Tree`.
+ *
+ * DuplicateObject alone does NOT do this. A panel's children are outered to the
+ * WidgetTree, not to the panel, so they are ordinary references rather than
+ * subobjects and the duplicator copies none of them — the "copy" comes back with
+ * fresh slots still pointing at the ORIGINAL children. Anything done to the copy's
+ * subtree from then on is done to the source: walking it and renaming for
+ * uniqueness renames the originals out from under every graph node and binding
+ * that named them, silently, until a lookup fails.
+ *
+ * So the children are copied here, explicitly, one level at a time.
+ */
+UWidget* DeepDuplicateWidget(UWidgetTree* Tree, UWidget* Source, FName DesiredName)
+{
+	UWidget* Copy = DuplicateObject<UWidget>(Source, Tree, DesiredName);
+	if (!Copy)
+	{
+		return nullptr;
+	}
+
+	UPanelWidget* SourcePanel = Cast<UPanelWidget>(Source);
+	UPanelWidget* CopyPanel = Cast<UPanelWidget>(Copy);
+	if (!SourcePanel || !CopyPanel)
+	{
+		return Copy;
+	}
+
+	const int32 NumChildren = SourcePanel->GetChildrenCount();
+	TArray<UWidget*> SourceChildren;
+	TArray<UPanelSlot*> SourceSlots;
+	SourceChildren.Reserve(NumChildren);
+	SourceSlots.Reserve(NumChildren);
+	for (int32 Index = 0; Index < NumChildren; ++Index)
+	{
+		UWidget* Child = SourcePanel->GetChildAt(Index);
+		SourceChildren.Add(Child);
+		SourceSlots.Add(Child ? Child->Slot : nullptr);
+	}
+
+	// Drop the copied slots, which still point at the originals. ClearChildren runs
+	// RemoveChildAt, and that nulls Content->Slot on whatever the slot points at —
+	// the originals — so their slots are put straight back afterwards.
+	CopyPanel->ClearChildren();
+	for (int32 Index = 0; Index < NumChildren; ++Index)
+	{
+		if (SourceChildren[Index])
+		{
+			SourceChildren[Index]->Slot = SourceSlots[Index];
+		}
+	}
+
+	for (int32 Index = 0; Index < NumChildren; ++Index)
+	{
+		UWidget* SourceChild = SourceChildren[Index];
+		if (!SourceChild)
+		{
+			continue;
+		}
+
+		UWidget* ChildCopy = DeepDuplicateWidget(
+			Tree, SourceChild, MakeUniqueWidgetName(Tree, SourceChild->GetFName()));
+		if (!ChildCopy)
+		{
+			continue;
+		}
+
+		UPanelSlot* NewSlot = CopyPanel->AddChild(ChildCopy);
+
+		// AddChild makes a default slot, so the layout (padding, alignment, size
+		// rules) has to be carried over. Parent/Content come across as the source's
+		// and are corrected right after.
+		if (NewSlot && SourceSlots[Index] && NewSlot->GetClass() == SourceSlots[Index]->GetClass())
+		{
+			TArray<uint8> SlotBytes;
+			FObjectWriter(SourceSlots[Index], SlotBytes);
+			FObjectReader(NewSlot, SlotBytes);
+			NewSlot->Parent = CopyPanel;
+			NewSlot->Content = ChildCopy;
+			NewSlot->SynchronizeProperties();
+		}
+	}
+
+	return Copy;
+}
+} // namespace
+
 TSharedPtr<FJsonObject> FEpicUnrealMCPWidgetCommands::HandleDuplicateWidget(
 	const TSharedPtr<FJsonObject>& Params)
 {
@@ -742,58 +851,12 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPWidgetCommands::HandleDuplicateWidget(
 				FString::Printf(TEXT("Widget name '%s' already exists"), *NewName));
 	}
 
-	// Duplicate the widget (deep copy including children)
-	UWidget* DuplicatedWidget = DuplicateObject<UWidget>(SourceWidget, Tree, FName(*NewName));
+	// Copy the widget and, explicitly, everything under it. Children are outered to
+	// the tree rather than to their panel, so a plain DuplicateObject would hand back
+	// a copy still wired to the ORIGINAL children — see DeepDuplicateWidget.
+	UWidget* DuplicatedWidget = DeepDuplicateWidget(Tree, SourceWidget, FName(*NewName));
 	if (!DuplicatedWidget)
 		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to duplicate widget"));
-
-	// DuplicateObject may set child widgets' Outer to the duplicated widget instead
-	// of the WidgetTree. ForEachSourceWidget (used by the compiler's GUID validation)
-	// uses ForEachObjectWithOuter(WidgetTree, bIncludeNestedObjects=false), which only
-	// finds objects whose DIRECT Outer is the WidgetTree. Re-outer all children.
-	UWidgetTree::ForWidgetAndChildren(DuplicatedWidget, [&](UWidget* SubWidget)
-	{
-		if (SubWidget && SubWidget->GetOuter() != Tree)
-		{
-			SubWidget->Rename(nullptr, Tree, REN_DontCreateRedirectors);
-		}
-	});
-
-	// Rename any child widgets that conflict with existing names in the tree
-	if (DuplicatedWidget->IsA<UPanelWidget>())
-	{
-		TArray<UWidget*> ExistingWidgets;
-		Tree->GetAllWidgets(ExistingWidgets);
-		TSet<FName> ExistingNames;
-		for (UWidget* W : ExistingWidgets)
-		{
-			if (W)
-			{
-				ExistingNames.Add(W->GetFName());
-			}
-		}
-
-		UWidgetTree::ForWidgetAndChildren(DuplicatedWidget, [&](UWidget* SubWidget)
-		{
-			if (!SubWidget || SubWidget == DuplicatedWidget)
-			{
-				return;
-			}
-			if (ExistingNames.Contains(SubWidget->GetFName()))
-			{
-				int32 Counter = 0;
-				FName UniqueName;
-				do
-				{
-					UniqueName = FName(*FString::Printf(TEXT("%s_Dup%d"),
-						*SubWidget->GetName(), Counter++));
-				} while (ExistingNames.Contains(UniqueName));
-
-				SubWidget->Rename(*UniqueName.ToString(), Tree, REN_DontCreateRedirectors);
-				ExistingNames.Add(UniqueName);
-			}
-		});
-	}
 
 	// Clear the duplicated Slot reference — AddChild will create a fresh one.
 	// Without this, the stale duplicated slot remains as a UObject with Outer=Tree.

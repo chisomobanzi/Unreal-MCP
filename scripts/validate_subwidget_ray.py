@@ -59,7 +59,7 @@ def wait_pie(active, timeout=90):
 
 def log_tail_offset():
     root = _find_project_root() or os.getcwd()
-    path = os.path.join(root, "Saved", "Logs", "Speakeasy3D_v1.log")
+    path = os.path.join(root, "Saved", "Logs", "Speakeasy3D.log")
     try:
         return path, os.path.getsize(path)
     except OSError:

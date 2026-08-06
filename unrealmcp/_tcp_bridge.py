@@ -265,7 +265,32 @@ class _TCPConnection:
         by a crashed/previous editor instance.
         """
         if self._sock is not None:
-            return True
+            # A parked socket may be a corpse: the single-client bridge closes the
+            # previous connection whenever ANY other client connects (a 3s health
+            # poller guarantees it), and sendall() into that corpse "succeeds" into
+            # the kernel buffer — the command is never read, the response read gets
+            # 0 bytes, and the no-retry-after-send rule turns it into a hard error
+            # ("delivered to the editor but no response", 2026-08-07: every other
+            # command failing for an entire evening). A zero-byte MSG_PEEK here
+            # proves the far end closed BEFORE reading anything we are about to
+            # send, so reconnecting is provably double-execution-safe.
+            try:
+                self._sock.setblocking(False)
+                try:
+                    peeked = self._sock.recv(1, socket.MSG_PEEK)
+                    dead = (peeked == b"")   # orderly FIN already received
+                except (BlockingIOError, InterruptedError):
+                    dead = False             # nothing to read — socket healthy
+                except OSError:
+                    dead = True              # RST or worse
+                finally:
+                    self._sock.setblocking(True)
+            except OSError:
+                dead = True
+            if not dead:
+                return True
+            logger.info("Parked bridge socket was closed by the editor — reconnecting")
+            self._close_unsafe()
         port = self._get_port()
         for candidate in (port, DEFAULT_PORT):
             try:

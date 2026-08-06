@@ -35,10 +35,20 @@ uint32 FMCPServerRunnable::Run()
 		// blocks — this is what keeps the fast path alive during hangs).
 		ServicePendingCommand();
 
+		// A client that is owed a game-thread response keeps its connection: accepting a
+		// newcomer here used to CLOSE the previous socket, so any second client polling the
+		// bridge (health watchers connect every few seconds) beheaded every command slower
+		// than its poll interval — the caller saw "Connection closed after 0/4 bytes" while
+		// the editor finished the work and had nowhere to send it (2026-08-07, a full evening
+		// of asset-loading commands lost to a 3s get_pie_status poller). Newcomers wait in
+		// the OS listen backlog until the response is delivered.
+		const bool bClientOwedResponse =
+			bHasPending && PendingSocket.IsValid() && PendingSocket == ClientSocket;
+
 		bool bPending = false;
-		if (ListenerSocket->HasPendingConnection(bPending) && bPending)
+		if (!bClientOwedResponse && ListenerSocket->HasPendingConnection(bPending) && bPending)
 		{
-			// If we already have a client, close it to make room for the new one.
+			// If we already have an idle client, close it to make room for the new one.
 			// The old client's Python side will reconnect automatically on its next command.
 			if (ClientSocket.IsValid())
 			{

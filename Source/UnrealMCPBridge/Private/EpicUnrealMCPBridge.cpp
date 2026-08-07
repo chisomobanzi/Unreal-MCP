@@ -1149,6 +1149,7 @@ TFuture<FString> UEpicUnrealMCPBridge::DispatchCommandAsync(
 				ResultJson = DataAssetCommands->HandleCommand(CommandType, Params);
 			}
 			else if (CommandType == TEXT("add_blueprint_node") ||
+				CommandType == TEXT("ensure_anim_slot") ||
 				CommandType == TEXT("connect_nodes") ||
 				CommandType == TEXT("disconnect_nodes") ||
 				CommandType == TEXT("add_delegate_node") ||

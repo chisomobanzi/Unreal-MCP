@@ -11,6 +11,17 @@
 #include "Commands/BlueprintGraph/Function/FunctionIO.h"
 #include "Commands/BlueprintGraph/Nodes/EventBindingNodes.h"
 
+// ensure_anim_slot — anim-graph surgery is unreachable from Python, so it
+// lives here (the same reason the widget-tree commands exist).
+#include "Animation/AnimBlueprint.h"
+#include "AnimGraphNode_Root.h"
+#include "AnimGraphNode_Slot.h"
+#include "EdGraph/EdGraph.h"
+#include "Kismet2/BlueprintEditorUtils.h"
+#include "Kismet2/KismetEditorUtilities.h"
+#include "UObject/SavePackage.h"
+#include "Misc/PackageName.h"
+
 FEpicUnrealMCPBlueprintGraphCommands::FEpicUnrealMCPBlueprintGraphCommands()
 {
 }
@@ -26,6 +37,10 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPBlueprintGraphCommands::HandleCommand(
 	if (CommandType == TEXT("add_blueprint_node"))
 	{
 		return HandleAddBlueprintNode(Params);
+	}
+	else if (CommandType == TEXT("ensure_anim_slot"))
+	{
+		return HandleEnsureAnimSlot(Params);
 	}
 	else if (CommandType == TEXT("connect_nodes"))
 	{
@@ -94,6 +109,115 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPBlueprintGraphCommands::HandleCommand(
 
 	return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
 		FString::Printf(TEXT("Unknown blueprint graph command: %s"), *CommandType));
+}
+
+TSharedPtr<FJsonObject> FEpicUnrealMCPBlueprintGraphCommands::HandleEnsureAnimSlot(
+	const TSharedPtr<FJsonObject>& Params)
+{
+	// Insert a Slot node (default "DefaultSlot") between the AnimGraph's final
+	// pose source and its Root, so montages have somewhere to blend. Idempotent:
+	// an existing slot of that name reports success without touching the graph.
+	FString BlueprintPath;
+	if (!Params->TryGetStringField(TEXT("blueprint_path"), BlueprintPath))
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'blueprint_path'"));
+	}
+	FString SlotName = TEXT("DefaultSlot");
+	Params->TryGetStringField(TEXT("slot_name"), SlotName);
+
+	UAnimBlueprint* AnimBP = LoadObject<UAnimBlueprint>(nullptr, *BlueprintPath);
+	if (!AnimBP)
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+			FString::Printf(TEXT("Not an AnimBlueprint: %s"), *BlueprintPath));
+	}
+
+	// The main anim graph is the function graph literally named AnimGraph.
+	UEdGraph* AnimGraph = nullptr;
+	for (UEdGraph* Graph : AnimBP->FunctionGraphs)
+	{
+		if (Graph && Graph->GetFName() == TEXT("AnimGraph"))
+		{
+			AnimGraph = Graph;
+			break;
+		}
+	}
+	if (!AnimGraph)
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("No AnimGraph found"));
+	}
+
+	UAnimGraphNode_Root* Root = nullptr;
+	for (UEdGraphNode* Node : AnimGraph->Nodes)
+	{
+		if (UAnimGraphNode_Slot* Existing = Cast<UAnimGraphNode_Slot>(Node))
+		{
+			if (Existing->Node.SlotName == FName(*SlotName))
+			{
+				TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+				Result->SetBoolField(TEXT("already_present"), true);
+				return FEpicUnrealMCPCommonUtils::CreateSuccessResponse(Result);
+			}
+		}
+		if (!Root)
+		{
+			Root = Cast<UAnimGraphNode_Root>(Node);
+		}
+	}
+	if (!Root)
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("AnimGraph has no Root node"));
+	}
+
+	UEdGraphPin* RootPoseIn = nullptr;
+	for (UEdGraphPin* Pin : Root->Pins)
+	{
+		if (Pin->Direction == EGPD_Input)
+		{
+			RootPoseIn = Pin;
+			break;
+		}
+	}
+	if (!RootPoseIn || RootPoseIn->LinkedTo.Num() == 0)
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Root pose input is unlinked"));
+	}
+	UEdGraphPin* Source = RootPoseIn->LinkedTo[0];
+
+	UAnimGraphNode_Slot* SlotNode = NewObject<UAnimGraphNode_Slot>(AnimGraph);
+	SlotNode->Node.SlotName = FName(*SlotName);
+	SlotNode->CreateNewGuid();
+	AnimGraph->AddNode(SlotNode, /*bFromUI*/ false, /*bSelectNewNode*/ false);
+	SlotNode->PostPlacedNewNode();
+	SlotNode->AllocateDefaultPins();
+	SlotNode->NodePosX = Root->NodePosX - 220;
+	SlotNode->NodePosY = Root->NodePosY;
+
+	UEdGraphPin* SlotIn = nullptr;
+	UEdGraphPin* SlotOut = nullptr;
+	for (UEdGraphPin* Pin : SlotNode->Pins)
+	{
+		if (Pin->Direction == EGPD_Input && !SlotIn) { SlotIn = Pin; }
+		if (Pin->Direction == EGPD_Output && !SlotOut) { SlotOut = Pin; }
+	}
+	if (!SlotIn || !SlotOut)
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Slot node pins missing"));
+	}
+
+	RootPoseIn->BreakAllPinLinks();
+	SlotIn->MakeLinkTo(Source);
+	SlotOut->MakeLinkTo(RootPoseIn);
+
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
+	FKismetEditorUtilities::CompileBlueprint(AnimBP);
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetBoolField(TEXT("inserted"), true);
+	Result->SetStringField(TEXT("slot_name"), SlotName);
+	Result->SetBoolField(TEXT("compiled_ok"),
+		AnimBP->Status != EBlueprintStatus::BS_Error);
+	return FEpicUnrealMCPCommonUtils::CreateSuccessResponse(Result);
 }
 
 TSharedPtr<FJsonObject> FEpicUnrealMCPBlueprintGraphCommands::HandleAddBlueprintNode(

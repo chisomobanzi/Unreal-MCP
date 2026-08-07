@@ -15,6 +15,7 @@ public:
 
 private:
 	TSharedPtr<FJsonObject> HandleAddBlueprintNode(const TSharedPtr<FJsonObject>& Params);
+	TSharedPtr<FJsonObject> HandleEnsureAnimSlot(const TSharedPtr<FJsonObject>& Params);
 	TSharedPtr<FJsonObject> HandleConnectNodes(const TSharedPtr<FJsonObject>& Params);
 	TSharedPtr<FJsonObject> HandleCreateVariable(const TSharedPtr<FJsonObject>& Params);
 	TSharedPtr<FJsonObject> HandleSetVariableProperties(const TSharedPtr<FJsonObject>& Params);

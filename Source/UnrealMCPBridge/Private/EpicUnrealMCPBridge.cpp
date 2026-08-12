@@ -1150,6 +1150,7 @@ TFuture<FString> UEpicUnrealMCPBridge::DispatchCommandAsync(
 			}
 			else if (CommandType == TEXT("add_blueprint_node") ||
 				CommandType == TEXT("ensure_anim_slot") ||
+				CommandType == TEXT("ensure_gesture_layer") ||
 				CommandType == TEXT("connect_nodes") ||
 				CommandType == TEXT("disconnect_nodes") ||
 				CommandType == TEXT("add_delegate_node") ||

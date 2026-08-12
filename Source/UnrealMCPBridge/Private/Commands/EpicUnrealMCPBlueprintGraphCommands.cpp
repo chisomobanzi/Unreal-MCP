@@ -16,6 +16,8 @@
 #include "Animation/AnimBlueprint.h"
 #include "AnimGraphNode_Root.h"
 #include "AnimGraphNode_Slot.h"
+#include "AnimGraphNode_LayeredBoneBlend.h"
+#include "AnimGraphNode_Inertialization.h"
 #include "EdGraph/EdGraph.h"
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "Kismet2/KismetEditorUtilities.h"
@@ -41,6 +43,10 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPBlueprintGraphCommands::HandleCommand(
 	else if (CommandType == TEXT("ensure_anim_slot"))
 	{
 		return HandleEnsureAnimSlot(Params);
+	}
+	else if (CommandType == TEXT("ensure_gesture_layer"))
+	{
+		return HandleEnsureGestureLayer(Params);
 	}
 	else if (CommandType == TEXT("connect_nodes"))
 	{
@@ -215,6 +221,175 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPBlueprintGraphCommands::HandleEnsureAnimSl
 	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
 	Result->SetBoolField(TEXT("inserted"), true);
 	Result->SetStringField(TEXT("slot_name"), SlotName);
+	Result->SetBoolField(TEXT("compiled_ok"),
+		AnimBP->Status != EBlueprintStatus::BS_Error);
+	return FEpicUnrealMCPCommonUtils::CreateSuccessResponse(Result);
+}
+
+TSharedPtr<FJsonObject> FEpicUnrealMCPBlueprintGraphCommands::HandleEnsureGestureLayer(
+	const TSharedPtr<FJsonObject>& Params)
+{
+	// Insert an upper-body gesture layer downstream of an existing base Slot:
+	//   base Slot ──┬─────────────────────────► LayeredBoneBlend.BasePose
+	//               └─► Slot(upper_slot) ─────► LayeredBoneBlend.BlendPoses_0
+	//   LayeredBoneBlend ─► Inertialization ─► (whatever the base Slot fed)
+	// The blend is masked from mask_bone up, so upper-body montages layer over
+	// the base pose without touching the legs; the Inertialization node serves
+	// every montage that requests inertial blending. Idempotent on upper_slot.
+	FString BlueprintPath;
+	if (!Params->TryGetStringField(TEXT("blueprint_path"), BlueprintPath))
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'blueprint_path'"));
+	}
+	FString BaseSlot = TEXT("DefaultSlot");
+	FString UpperSlot = TEXT("UpperBodySlot");
+	FString MaskBone = TEXT("J_Bip_C_Spine");
+	Params->TryGetStringField(TEXT("base_slot"), BaseSlot);
+	Params->TryGetStringField(TEXT("upper_slot"), UpperSlot);
+	Params->TryGetStringField(TEXT("mask_bone"), MaskBone);
+	int32 BlendDepth = 0;
+	if (Params->HasTypedField<EJson::Number>(TEXT("blend_depth")))
+	{
+		BlendDepth = static_cast<int32>(Params->GetNumberField(TEXT("blend_depth")));
+	}
+
+	UAnimBlueprint* AnimBP = LoadObject<UAnimBlueprint>(nullptr, *BlueprintPath);
+	if (!AnimBP)
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+			FString::Printf(TEXT("Not an AnimBlueprint: %s"), *BlueprintPath));
+	}
+
+	UEdGraph* AnimGraph = nullptr;
+	for (UEdGraph* Graph : AnimBP->FunctionGraphs)
+	{
+		if (Graph && Graph->GetFName() == TEXT("AnimGraph"))
+		{
+			AnimGraph = Graph;
+			break;
+		}
+	}
+	if (!AnimGraph)
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("No AnimGraph found"));
+	}
+
+	UAnimGraphNode_Slot* BaseSlotNode = nullptr;
+	for (UEdGraphNode* Node : AnimGraph->Nodes)
+	{
+		if (UAnimGraphNode_Slot* SlotNode = Cast<UAnimGraphNode_Slot>(Node))
+		{
+			if (SlotNode->Node.SlotName == FName(*UpperSlot))
+			{
+				TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+				Result->SetBoolField(TEXT("already_present"), true);
+				return FEpicUnrealMCPCommonUtils::CreateSuccessResponse(Result);
+			}
+			if (SlotNode->Node.SlotName == FName(*BaseSlot))
+			{
+				BaseSlotNode = SlotNode;
+			}
+		}
+	}
+	if (!BaseSlotNode)
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+			FString::Printf(TEXT("Base slot '%s' not found — run ensure_anim_slot first"), *BaseSlot));
+	}
+
+	UEdGraphPin* BaseOut = nullptr;
+	for (UEdGraphPin* Pin : BaseSlotNode->Pins)
+	{
+		if (Pin->Direction == EGPD_Output) { BaseOut = Pin; break; }
+	}
+	if (!BaseOut || BaseOut->LinkedTo.Num() == 0)
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Base slot output is unlinked"));
+	}
+	UEdGraphPin* Downstream = BaseOut->LinkedTo[0];
+
+	// Upper-body slot node.
+	UAnimGraphNode_Slot* UpperSlotNode = NewObject<UAnimGraphNode_Slot>(AnimGraph);
+	UpperSlotNode->Node.SlotName = FName(*UpperSlot);
+	UpperSlotNode->CreateNewGuid();
+	AnimGraph->AddNode(UpperSlotNode, false, false);
+	UpperSlotNode->PostPlacedNewNode();
+	UpperSlotNode->AllocateDefaultPins();
+	UpperSlotNode->NodePosX = BaseSlotNode->NodePosX + 200;
+	UpperSlotNode->NodePosY = BaseSlotNode->NodePosY + 160;
+
+	// Layered blend per bone, one layer masked at MaskBone.
+	UAnimGraphNode_LayeredBoneBlend* BlendNode = NewObject<UAnimGraphNode_LayeredBoneBlend>(AnimGraph);
+	BlendNode->CreateNewGuid();
+	AnimGraph->AddNode(BlendNode, false, false);
+	BlendNode->PostPlacedNewNode();
+	BlendNode->Node.AddPose();
+	if (BlendNode->Node.LayerSetup.Num() == 0)
+	{
+		BlendNode->Node.LayerSetup.AddDefaulted();
+	}
+	FBranchFilter Branch;
+	Branch.BoneName = FName(*MaskBone);
+	Branch.BlendDepth = BlendDepth;
+	BlendNode->Node.LayerSetup[0].BranchFilters.Reset();
+	BlendNode->Node.LayerSetup[0].BranchFilters.Add(Branch);
+	if (BlendNode->Node.BlendWeights.Num() > 0)
+	{
+		BlendNode->Node.BlendWeights[0] = 1.0f;
+	}
+	BlendNode->Node.bMeshSpaceRotationBlend = true;
+	BlendNode->ReconstructNode();
+	BlendNode->NodePosX = BaseSlotNode->NodePosX + 420;
+	BlendNode->NodePosY = BaseSlotNode->NodePosY + 60;
+
+	// Inertialization after the blend, before the original downstream chain.
+	UAnimGraphNode_Inertialization* InertNode = NewObject<UAnimGraphNode_Inertialization>(AnimGraph);
+	InertNode->CreateNewGuid();
+	AnimGraph->AddNode(InertNode, false, false);
+	InertNode->PostPlacedNewNode();
+	InertNode->AllocateDefaultPins();
+	InertNode->NodePosX = BaseSlotNode->NodePosX + 640;
+	InertNode->NodePosY = BaseSlotNode->NodePosY + 60;
+
+	auto FindPin = [](UEdGraphNode* Node, EEdGraphPinDirection Dir, const TCHAR* NameContains) -> UEdGraphPin*
+	{
+		for (UEdGraphPin* Pin : Node->Pins)
+		{
+			if (Pin->Direction == Dir &&
+				(!NameContains || Pin->PinName.ToString().Contains(NameContains)))
+			{
+				return Pin;
+			}
+		}
+		return nullptr;
+	};
+
+	UEdGraphPin* UpperIn = FindPin(UpperSlotNode, EGPD_Input, nullptr);
+	UEdGraphPin* UpperOut = FindPin(UpperSlotNode, EGPD_Output, nullptr);
+	UEdGraphPin* BlendBase = FindPin(BlendNode, EGPD_Input, TEXT("BasePose"));
+	UEdGraphPin* BlendPose0 = FindPin(BlendNode, EGPD_Input, TEXT("BlendPoses"));
+	UEdGraphPin* BlendOut = FindPin(BlendNode, EGPD_Output, nullptr);
+	UEdGraphPin* InertIn = FindPin(InertNode, EGPD_Input, nullptr);
+	UEdGraphPin* InertOut = FindPin(InertNode, EGPD_Output, nullptr);
+	if (!UpperIn || !UpperOut || !BlendBase || !BlendPose0 || !BlendOut || !InertIn || !InertOut)
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Expected pins missing on new nodes"));
+	}
+
+	BaseOut->BreakAllPinLinks();
+	BaseOut->MakeLinkTo(BlendBase);
+	BaseOut->MakeLinkTo(UpperIn);
+	UpperOut->MakeLinkTo(BlendPose0);
+	BlendOut->MakeLinkTo(InertIn);
+	InertOut->MakeLinkTo(Downstream);
+
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
+	FKismetEditorUtilities::CompileBlueprint(AnimBP);
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetBoolField(TEXT("inserted"), true);
+	Result->SetStringField(TEXT("upper_slot"), UpperSlot);
+	Result->SetStringField(TEXT("mask_bone"), MaskBone);
 	Result->SetBoolField(TEXT("compiled_ok"),
 		AnimBP->Status != EBlueprintStatus::BS_Error);
 	return FEpicUnrealMCPCommonUtils::CreateSuccessResponse(Result);

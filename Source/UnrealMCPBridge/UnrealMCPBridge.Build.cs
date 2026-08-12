@@ -47,6 +47,7 @@ public class UnrealMCPBridge : ModuleRules
 				"UnrealEd",
 				"BlueprintGraph",
 				"AnimGraph",
+				"AnimGraphRuntime",
 				"KismetCompiler"
 			}
 		);

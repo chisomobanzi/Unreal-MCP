@@ -2193,9 +2193,25 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleFrameActor(
 	// Same as pressing F in the viewport — frames the actor's bounds.
 	GEditor->MoveViewportCamerasToActor(*Actor, /*bActiveViewportOnly=*/false);
 
+	// Degenerate bounds mean the camera framed effectively nothing (an
+	// empty mesh component, an unconfigured actor) — say so instead of
+	// letting the follow-up screenshot show unexplained skybox.
+	FVector Origin, Extent;
+	Actor->GetActorBounds(/*bOnlyCollidingComponents=*/false, Origin, Extent,
+		/*bIncludeFromChildActors=*/true);
+	const double BoundsRadius = Extent.Length();
+
 	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
 	Result->SetBoolField(TEXT("success"), true);
 	Result->SetStringField(TEXT("framed"), Actor->GetActorLabel());
+	Result->SetNumberField(TEXT("bounds_radius"), BoundsRadius);
+	if (BoundsRadius < 10.0)
+	{
+		Result->SetStringField(TEXT("warning"), FString::Printf(
+			TEXT("Actor bounds radius is only %.1fcm — the viewport may be "
+			     "framing empty space. Is the actor's mesh/component set?"),
+			BoundsRadius));
+	}
 	return Result;
 }
 

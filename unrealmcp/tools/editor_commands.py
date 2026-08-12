@@ -291,7 +291,10 @@ def frame_actor(actor: str) -> str:
     """Aim the level viewport at an actor (same as selecting it and pressing F).
 
     Accepts the actor's display label, object name, or path. Follow with
-    take_screenshot to see the result.
+    take_screenshot to see the result. The response includes the actor's
+    bounds_radius (cm) and a warning when it is degenerate (<10cm) — i.e.
+    the camera is probably framing empty space because the actor's mesh
+    or component isn't set up yet.
     """
     return _call("frame_actor", {"actor": actor})
 

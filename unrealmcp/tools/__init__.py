@@ -9,7 +9,7 @@ advertises, useful for focused sessions on a harness without lazy tool loading.
     UNREAL_MCP_TOOLS=materials,level,editor_commands   # look-dev session
     UNREAL_MCP_TOOLS=niagara                            # VFX session
 
-Module names: assets, materials, blueprints, level, data_tables,
+Module names: animation, assets, materials, blueprints, level, data_tables,
 blueprint_graph, editor_commands, data_assets, widgets, enhanced_input,
 profiling, debug, niagara, statetree.
 """
@@ -22,6 +22,7 @@ logger = logging.getLogger("UnrealMCP.Tools")
 # Optional tool modules (core is always loaded — execute_python / health_check
 # / wait_until_ready are essential and must never be filtered out).
 _ALL_MODULES = [
+    "animation",
     "assets",
     "materials",
     "blueprints",

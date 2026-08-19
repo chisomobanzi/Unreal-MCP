@@ -28,6 +28,7 @@ private:
 	TSharedPtr<FJsonObject> HandleGetBlueprintMaterialInfo(const TSharedPtr<FJsonObject>& Params);
 	TSharedPtr<FJsonObject> HandleReadBlueprintContent(const TSharedPtr<FJsonObject>& Params);
 	TSharedPtr<FJsonObject> HandleAnalyzeBlueprintGraph(const TSharedPtr<FJsonObject>& Params);
+	TSharedPtr<FJsonObject> HandleQueryBlueprintGraph(const TSharedPtr<FJsonObject>& Params);
 	TSharedPtr<FJsonObject> HandleGetBlueprintVariableDetails(const TSharedPtr<FJsonObject>& Params);
 	TSharedPtr<FJsonObject> HandleGetBlueprintFunctionDetails(const TSharedPtr<FJsonObject>& Params);
 	TSharedPtr<FJsonObject> HandleGetBlueprintClassDefaults(const TSharedPtr<FJsonObject>& Params);

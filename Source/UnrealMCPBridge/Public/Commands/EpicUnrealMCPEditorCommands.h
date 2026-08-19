@@ -68,4 +68,5 @@ private:
 	// is public), press + release the pointer key. Deterministic — no
 	// dependency on the component being ticked by the world.
 	TSharedPtr<FJsonObject> HandleHandRayClick(const TSharedPtr<FJsonObject>& Params);
+	TSharedPtr<FJsonObject> HandleCallSubsystem(const TSharedPtr<FJsonObject>& Params);
 };

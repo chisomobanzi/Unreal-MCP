@@ -100,6 +100,18 @@ private:
 	// health_check. Guards against executing commands during editor boot.
 	void RefreshReadinessCache();
 
+	// Command journal (idempotency-lite): responses of completed commands that
+	// carried a client-supplied command_id, so a client whose socket died after
+	// sending can ask "did my command run?" (get_command_result) instead of
+	// blind-resending — the double-execution hazard the no-retry-after-send
+	// rule exists to prevent. Written at ExecuteCommand's slow-path tail and
+	// read by the get_command_result fast-path, both on the socket thread; the
+	// lock still guards the pair against future multi-threading of the server.
+	FCriticalSection JournalLock;
+	TMap<FString, FString> CommandJournal;
+	TArray<FString> JournalOrder;
+	static constexpr int32 JournalCapacity = 128;
+
 	// Token debug: estimate tokens from a JSON result and optionally inject _debug field
 	void InjectTokenDebugInfo(
 		const FString& CommandType,

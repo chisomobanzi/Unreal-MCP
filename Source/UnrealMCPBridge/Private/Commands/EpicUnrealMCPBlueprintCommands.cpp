@@ -93,6 +93,10 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPBlueprintCommands::HandleCommand(
 	{
 		return HandleAnalyzeBlueprintGraph(Params);
 	}
+	else if (CommandType == TEXT("query_blueprint_graph"))
+	{
+		return HandleQueryBlueprintGraph(Params);
+	}
 	else if (CommandType == TEXT("get_blueprint_variable_details"))
 	{
 		return HandleGetBlueprintVariableDetails(Params);
@@ -1924,4 +1928,179 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPBlueprintCommands::HandleSetBlueprintClass
 	}
 
 	return Result;
+}
+
+TSharedPtr<FJsonObject> FEpicUnrealMCPBlueprintCommands::HandleQueryBlueprintGraph(
+	const TSharedPtr<FJsonObject>& Params)
+{
+	// The forensic reader read_blueprint_content never was: scoped to one graph, filtered to the
+	// nodes you asked about, and carrying the answers that actually settle investigations — pin
+	// DEFAULTS (enum literals, class pickers, object refs) and connections. Born 2026-08-19 after
+	// a grab-path root-cause had to fall back to `strings` on the .uasset for exactly those pins.
+	FString BlueprintPath;
+	if (!Params->TryGetStringField(TEXT("blueprint_path"), BlueprintPath))
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'blueprint_path' parameter"));
+	}
+
+	FString GraphScope = TEXT("all");            // "all" | "event_graph" | a function/macro graph name
+	FString NodeFilter;                          // case-insensitive substring vs class name, title, member
+	bool bIncludePins = true;
+	bool bIncludeConnections = false;
+	int32 MaxNodes = 50;
+	int32 Offset = 0;
+	Params->TryGetStringField(TEXT("graph_scope"), GraphScope);
+	Params->TryGetStringField(TEXT("node_filter"), NodeFilter);
+	Params->TryGetBoolField(TEXT("include_pins"), bIncludePins);
+	Params->TryGetBoolField(TEXT("include_connections"), bIncludeConnections);
+	Params->TryGetNumberField(TEXT("max_nodes"), MaxNodes);
+	Params->TryGetNumberField(TEXT("offset"), Offset);
+	MaxNodes = FMath::Clamp(MaxNodes, 1, 500);
+	Offset = FMath::Max(0, Offset);
+
+	UBlueprint* Blueprint = Cast<UBlueprint>(UEditorAssetLibrary::LoadAsset(BlueprintPath));
+	if (!Blueprint)
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+			FString::Printf(TEXT("Failed to load blueprint: %s"), *BlueprintPath));
+	}
+
+	// Collect candidate graphs by scope. Function graphs are matched by exact name so
+	// "graph_scope": "GetGrabComponentNearMotionController" reads exactly one function.
+	TArray<UEdGraph*> Graphs;
+	const bool bScopeAll = GraphScope.Equals(TEXT("all"), ESearchCase::IgnoreCase);
+	const bool bScopeEvent = GraphScope.Equals(TEXT("event_graph"), ESearchCase::IgnoreCase);
+	if (bScopeAll || bScopeEvent)
+	{
+		for (UEdGraph* G : Blueprint->UbergraphPages) { if (G) { Graphs.Add(G); } }
+	}
+	if (!bScopeEvent)
+	{
+		for (UEdGraph* G : Blueprint->FunctionGraphs)
+		{
+			if (G && (bScopeAll || G->GetName().Equals(GraphScope, ESearchCase::IgnoreCase)))
+			{
+				Graphs.Add(G);
+			}
+		}
+		for (UEdGraph* G : Blueprint->MacroGraphs)
+		{
+			if (G && (bScopeAll || G->GetName().Equals(GraphScope, ESearchCase::IgnoreCase)))
+			{
+				Graphs.Add(G);
+			}
+		}
+	}
+	if (Graphs.Num() == 0)
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(
+			TEXT("No graph matched scope '%s' (use \"all\", \"event_graph\", or an exact function/macro name)"),
+			*GraphScope));
+	}
+
+	int32 TotalMatched = 0;
+	int32 Emitted = 0;
+	TArray<TSharedPtr<FJsonValue>> NodeArray;
+
+	for (UEdGraph* Graph : Graphs)
+	{
+		for (UEdGraphNode* Node : Graph->Nodes)
+		{
+			if (!Node) { continue; }
+
+			const FString ClassName = Node->GetClass()->GetName();
+			const FString Title = Node->GetNodeTitle(ENodeTitleType::ListView).ToString();
+
+			if (!NodeFilter.IsEmpty()
+				&& !ClassName.Contains(NodeFilter)
+				&& !Title.Contains(NodeFilter))
+			{
+				// Member-name matching rides on pin sub-objects below; cheap title/class
+				// filtering first covers the common "find the SphereTrace" ask.
+				bool bPinMatch = false;
+				for (UEdGraphPin* Pin : Node->Pins)
+				{
+					if (Pin && ((Pin->DefaultObject && Pin->DefaultObject->GetName().Contains(NodeFilter))
+						|| Pin->DefaultValue.Contains(NodeFilter)))
+					{
+						bPinMatch = true;
+						break;
+					}
+				}
+				if (!bPinMatch) { continue; }
+			}
+
+			++TotalMatched;
+			if (TotalMatched <= Offset || Emitted >= MaxNodes) { continue; }
+			++Emitted;
+
+			TSharedPtr<FJsonObject> NodeObj = MakeShared<FJsonObject>();
+			NodeObj->SetStringField(TEXT("id"), Node->NodeGuid.ToString(EGuidFormats::Short));
+			NodeObj->SetStringField(TEXT("graph"), Graph->GetName());
+			NodeObj->SetStringField(TEXT("class"), ClassName);
+			NodeObj->SetStringField(TEXT("title"), Title);
+
+			if (bIncludePins)
+			{
+				TArray<TSharedPtr<FJsonValue>> PinArray;
+				for (UEdGraphPin* Pin : Node->Pins)
+				{
+					if (!Pin) { continue; }
+					TSharedPtr<FJsonObject> PinObj = MakeShared<FJsonObject>();
+					PinObj->SetStringField(TEXT("name"), Pin->PinName.ToString());
+					PinObj->SetStringField(TEXT("direction"),
+						Pin->Direction == EGPD_Input ? TEXT("in") : TEXT("out"));
+					FString TypeStr = Pin->PinType.PinCategory.ToString();
+					if (Pin->PinType.PinSubCategoryObject.IsValid())
+					{
+						TypeStr += TEXT(":") + Pin->PinType.PinSubCategoryObject->GetName();
+					}
+					PinObj->SetStringField(TEXT("type"), TypeStr);
+					// The forensic payload: literal defaults (enum entries like ObjectTypeQuery2,
+					// numbers, names) and object/class picker defaults, only when present.
+					if (!Pin->DefaultValue.IsEmpty())
+					{
+						PinObj->SetStringField(TEXT("default_value"), Pin->DefaultValue);
+					}
+					if (Pin->DefaultObject)
+					{
+						PinObj->SetStringField(TEXT("default_object"), Pin->DefaultObject->GetPathName());
+					}
+					if (!Pin->DefaultTextValue.IsEmpty())
+					{
+						PinObj->SetStringField(TEXT("default_text"), Pin->DefaultTextValue.ToString());
+					}
+					if (bIncludeConnections && Pin->LinkedTo.Num() > 0)
+					{
+						TArray<TSharedPtr<FJsonValue>> Links;
+						for (UEdGraphPin* Linked : Pin->LinkedTo)
+						{
+							if (!Linked || !Linked->GetOwningNode()) { continue; }
+							TSharedPtr<FJsonObject> LinkObj = MakeShared<FJsonObject>();
+							LinkObj->SetStringField(TEXT("node_id"),
+								Linked->GetOwningNode()->NodeGuid.ToString(EGuidFormats::Short));
+							LinkObj->SetStringField(TEXT("node_title"),
+								Linked->GetOwningNode()->GetNodeTitle(ENodeTitleType::ListView).ToString());
+							LinkObj->SetStringField(TEXT("pin"), Linked->PinName.ToString());
+							Links.Add(MakeShared<FJsonValueObject>(LinkObj));
+						}
+						PinObj->SetArrayField(TEXT("linked_to"), Links);
+					}
+					PinArray.Add(MakeShared<FJsonValueObject>(PinObj));
+				}
+				NodeObj->SetArrayField(TEXT("pins"), PinArray);
+			}
+			NodeArray.Add(MakeShared<FJsonValueObject>(NodeObj));
+		}
+	}
+
+	TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+	ResultObj->SetStringField(TEXT("blueprint_path"), BlueprintPath);
+	ResultObj->SetStringField(TEXT("graph_scope"), GraphScope);
+	ResultObj->SetNumberField(TEXT("total_matched"), TotalMatched);
+	ResultObj->SetNumberField(TEXT("offset"), Offset);
+	ResultObj->SetNumberField(TEXT("returned"), Emitted);
+	ResultObj->SetArrayField(TEXT("nodes"), NodeArray);
+	ResultObj->SetBoolField(TEXT("success"), true);
+	return ResultObj;
 }

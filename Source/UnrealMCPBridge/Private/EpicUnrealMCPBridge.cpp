@@ -698,6 +698,35 @@ FString UEpicUnrealMCPBridge::ExecuteCommand(
 		return SerializeResponse(ResponseJson);
 	}
 
+	if (CommandType == TEXT("get_command_result"))
+	{
+		// Fast-path on purpose: the whole point is answering "did my command
+		// complete?" while the game thread is still executing it — which is
+		// exactly when a client with a dead socket needs the answer.
+		TSharedPtr<FJsonObject> ResponseJson = MakeShareable(new FJsonObject);
+		ResponseJson->SetStringField(TEXT("status"), TEXT("success"));
+		TSharedPtr<FJsonObject> ResultJson = MakeShareable(new FJsonObject);
+		FString QueryId;
+		if (Params.IsValid() && Params->TryGetStringField(TEXT("command_id"), QueryId)
+			&& !QueryId.IsEmpty())
+		{
+			FScopeLock Lock(&JournalLock);
+			if (const FString* Stored = CommandJournal.Find(QueryId))
+			{
+				// Verbatim replay of the completed command's response.
+				return *Stored;
+			}
+			ResultJson->SetBoolField(TEXT("found"), false);
+		}
+		else
+		{
+			ResultJson->SetBoolField(TEXT("found"), false);
+			ResultJson->SetStringField(TEXT("error"), TEXT("missing command_id"));
+		}
+		ResponseJson->SetObjectField(TEXT("result"), ResultJson);
+		return SerializeResponse(ResponseJson);
+	}
+
 	if (CommandType == TEXT("health_check"))
 	{
 		TSharedPtr<FJsonObject> ResponseJson = MakeShareable(new FJsonObject);
@@ -922,6 +951,19 @@ FString UEpicUnrealMCPBridge::ExecuteCommand(
 	// All other commands require the game thread for UObject/Editor API access.
 	// Kept for callers that want synchronous semantics; the socket loop uses
 	// DispatchCommandAsync directly so it can keep servicing fast-path
+	// A retried ask for a command that already completed answers from the
+	// journal — the client's resolve-by-query path after a lost response.
+	FString CommandId;
+	if (Params.IsValid() && Params->TryGetStringField(TEXT("command_id"), CommandId)
+		&& !CommandId.IsEmpty())
+	{
+		FScopeLock Lock(&JournalLock);
+		if (const FString* Stored = CommandJournal.Find(CommandId))
+		{
+			return *Stored;
+		}
+	}
+
 	// commands while a game-thread command is in flight.
 	TFuture<FString> Future = DispatchCommandAsync(CommandType, Params);
 
@@ -942,7 +984,22 @@ FString UEpicUnrealMCPBridge::ExecuteCommand(
 		return TEXT("{\"status\":\"error\",\"error\":\"Command timed out waiting for game thread\"}");
 	}
 
-	return Future.Get();
+	FString Response = Future.Get();
+	if (!CommandId.IsEmpty())
+	{
+		FScopeLock Lock(&JournalLock);
+		if (!CommandJournal.Contains(CommandId))
+		{
+			CommandJournal.Add(CommandId, Response);
+			JournalOrder.Add(CommandId);
+			while (JournalOrder.Num() > JournalCapacity)
+			{
+				CommandJournal.Remove(JournalOrder[0]);
+				JournalOrder.RemoveAt(0);
+			}
+		}
+	}
+	return Response;
 }
 
 bool UEpicUnrealMCPBridge::IsFastPathCommand(const FString& CommandType) const
@@ -952,6 +1009,7 @@ bool UEpicUnrealMCPBridge::IsFastPathCommand(const FString& CommandType) const
 	// thread is hung.
 	return CommandType == TEXT("ping")
 		|| CommandType == TEXT("health_check")
+		|| CommandType == TEXT("get_command_result")
 		|| CommandType == TEXT("set_unattended_mode")
 		|| CommandType == TEXT("get_bridge_events")
 		|| CommandType == TEXT("set_mcp_debug")
@@ -962,8 +1020,43 @@ TFuture<FString> UEpicUnrealMCPBridge::DispatchCommandAsync(
 	const FString& CommandType,
 	const TSharedPtr<FJsonObject>& Params)
 {
+	// Journal seam. This is the LIVE wire path — MCPServerRunnable dispatches slow
+	// commands here directly, bypassing ExecuteCommand — so both idempotent replay
+	// and the completed-response store must live on this future, not on
+	// ExecuteCommand's legacy synchronous tail.
+	FString JournalId;
+	if (Params.IsValid() && Params->TryGetStringField(TEXT("command_id"), JournalId)
+		&& !JournalId.IsEmpty())
+	{
+		FScopeLock Lock(&JournalLock);
+		if (const FString* Stored = CommandJournal.Find(JournalId))
+		{
+			TPromise<FString> Replay;
+			Replay.SetValue(*Stored);
+			return Replay.GetFuture();
+		}
+	}
+
 	TPromise<FString> Promise;
 	TFuture<FString> Future = Promise.GetFuture();
+	if (!JournalId.IsEmpty())
+	{
+		Future = Future.Next([this, JournalId](FString Response)
+		{
+			FScopeLock Lock(&JournalLock);
+			if (!CommandJournal.Contains(JournalId))
+			{
+				CommandJournal.Add(JournalId, Response);
+				JournalOrder.Add(JournalId);
+				while (JournalOrder.Num() > JournalCapacity)
+				{
+					CommandJournal.Remove(JournalOrder[0]);
+					JournalOrder.RemoveAt(0);
+				}
+			}
+			return Response;
+		});
+	}
 
 	AsyncTask(ENamedThreads::GameThread,
 		[this, CommandType, Params, Promise = MoveTemp(Promise)]() mutable
@@ -1038,7 +1131,8 @@ TFuture<FString> UEpicUnrealMCPBridge::DispatchCommandAsync(
 				CommandType == TEXT("debug_open_modal") ||
 				CommandType == TEXT("attach_interaction_ray") ||
 				CommandType == TEXT("get_runtime_widget_tree") ||
-				CommandType == TEXT("hand_ray_click"))
+				CommandType == TEXT("hand_ray_click") ||
+				CommandType == TEXT("call_subsystem"))
 			{
 				ResultJson = EditorCommands->HandleCommand(CommandType, Params);
 			}
@@ -1075,6 +1169,7 @@ TFuture<FString> UEpicUnrealMCPBridge::DispatchCommandAsync(
 				CommandType == TEXT("get_blueprint_material_info") ||
 				CommandType == TEXT("read_blueprint_content") ||
 				CommandType == TEXT("analyze_blueprint_graph") ||
+				CommandType == TEXT("query_blueprint_graph") ||
 				CommandType == TEXT("get_blueprint_variable_details") ||
 				CommandType == TEXT("get_blueprint_function_details") ||
 				CommandType == TEXT("get_blueprint_class_defaults") ||

@@ -19,6 +19,7 @@ import socket
 import logging
 import struct
 import time
+import uuid
 import threading
 from typing import Any, Dict, Optional
 
@@ -302,6 +303,7 @@ class _TCPConnection:
                         "default %d — port file was stale", port, candidate,
                     )
                     self._port = candidate
+                    self._heal_port_file(candidate)
                 logger.info(
                     "Connected to C++ bridge at %s:%d", TCP_HOST, candidate,
                 )
@@ -310,7 +312,76 @@ class _TCPConnection:
                 self._close_unsafe()
                 if candidate == DEFAULT_PORT:
                     break
+
+        # Last resort: the editor can be alive on a nearby port with BOTH the
+        # port file and the default stale (post-cook relaunch, second-instance
+        # leftovers). Scan a small window and adopt only a listener that
+        # answers a real framed ping — never a random service that happens to
+        # accept the connect.
+        for candidate in range(DEFAULT_PORT + 1, DEFAULT_PORT + 11):
+            if candidate == port or not self._probe_bridge(candidate):
+                continue
+            try:
+                self._sock = self._make_socket()
+                self._sock.connect((TCP_HOST, candidate))
+            except Exception:
+                self._close_unsafe()
+                continue
+            logger.warning(
+                "Bridge found by scan on %d (port file said %d, default %d "
+                "refused) — adopting and healing the port file",
+                candidate, port, DEFAULT_PORT,
+            )
+            self._port = candidate
+            self._heal_port_file(candidate)
+            return True
         return False
+
+    def _probe_bridge(self, port: int) -> bool:
+        """True only if `port` speaks the bridge protocol: framed ping -> pong."""
+        try:
+            probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            probe.settimeout(1.0)
+            probe.connect((TCP_HOST, port))
+            payload = json.dumps({"type": "ping", "params": {}}).encode("utf-8")
+            probe.sendall(struct.pack(">I", len(payload)) + payload)
+            header = b""
+            while len(header) < 4:
+                chunk = probe.recv(4 - len(header))
+                if not chunk:
+                    return False
+                header += chunk
+            length = struct.unpack(">I", header)[0]
+            if not 0 < length < 65536:
+                return False
+            body = b""
+            while len(body) < length:
+                chunk = probe.recv(min(length - len(body), 4096))
+                if not chunk:
+                    return False
+                body += chunk
+            return b"pong" in body
+        except Exception:
+            return False
+        finally:
+            try:
+                probe.close()
+            except Exception:
+                pass
+
+    def _heal_port_file(self, port: int) -> None:
+        """Rewrite port.txt to the port we actually connected on, so the next
+        client (and the next human reading the file) gets the truth. Best
+        effort: a read-only tree must not break connecting."""
+        root = _find_project_root()
+        if not root:
+            return
+        try:
+            with open(os.path.join(root, PORT_FILE), "w") as f:
+                f.write(str(port))
+            logger.info("Healed stale port file -> %d", port)
+        except OSError as exc:
+            logger.warning("Could not heal port file: %s", exc)
 
     def _recv_exact(self, n: int) -> bytes:
         """Read exactly n bytes from the socket."""
@@ -367,12 +438,30 @@ class _TCPConnection:
         still be executing it, and a blind retry would double-execute
         mutating commands (spawn/import/save/...).
         """
+        # Idempotency-lite: tag every command so a delivered-but-unconfirmed
+        # outcome can be RESOLVED by querying the bridge's journal instead of
+        # guessed at. The client never re-sends after a successful send — it
+        # asks "did command <id> complete?" — so double execution stays
+        # structurally impossible. Bridges without the journal simply answer
+        # found=false and the behavior degrades to today's hard error.
+        command_id = None
+        if command not in ("ping", "health_check", "get_command_result"):
+            params = dict(params or {})
+            # A caller-supplied id wins (tests and deliberate idempotent
+            # retries depend on it); otherwise mint one.
+            command_id = params.get("command_id") or uuid.uuid4().hex
+            params["command_id"] = command_id
+
         last_error = ""
         for attempt in range(MAX_RETRIES + 1):
             try:
                 return self._send_once(command, params)
             except PostSendError as exc:
                 logger.error("TCP command %s: %s", command, exc)
+                if command_id:
+                    resolved = self._resolve_via_journal(command, command_id)
+                    if resolved is not None:
+                        return resolved
                 return {"status": "error", "error": str(exc)}
             except (ConnectionError, TimeoutError, socket.error, OSError) as exc:
                 last_error = str(exc)
@@ -400,6 +489,37 @@ class _TCPConnection:
                 f"(last error: {last_error})"
             ),
         }
+
+    def _resolve_via_journal(
+        self,
+        command: str,
+        command_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """After a lost response, ask the bridge whether the command completed.
+
+        Polls get_command_result on a fresh connection: found -> the journaled
+        response, verbatim, as if the socket had never died. Not-found after
+        the poll window -> None (caller surfaces the original PostSendError;
+        the command may STILL be executing — the error text already says so).
+        """
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            time.sleep(1.5)
+            try:
+                resp = self._send_once(
+                    "get_command_result", {"command_id": command_id})
+            except Exception as exc:  # noqa: BLE001 — resolution is best-effort
+                logger.warning("Journal query for %s failed: %s", command, exc)
+                continue
+            result = resp.get("result") or {}
+            if result.get("found") is False:
+                continue
+            logger.info(
+                "Recovered %s (%s) from the bridge journal after a lost "
+                "response", command, command_id,
+            )
+            return resp
+        return None
 
     def _send_once(
         self,

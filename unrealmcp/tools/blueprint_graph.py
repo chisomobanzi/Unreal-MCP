@@ -521,6 +521,38 @@ def analyze_blueprint_graph(
 
 
 @mcp.tool()
+def query_blueprint_graph(
+    blueprint_path: str,
+    graph_scope: str = "all",
+    node_filter: str = "",
+    include_pins: bool = True,
+    include_connections: bool = False,
+    max_nodes: int = 50,
+    offset: int = 0,
+) -> str:
+    """Query Blueprint graph nodes WITH pin defaults — the forensic reader.
+
+    Scope to one graph ("event_graph", an exact function/macro name, or "all"),
+    filter nodes by a case-insensitive substring (matched against node class,
+    title, and pin default values/objects — so "SphereTrace" or "GrabComponent"
+    both hit), and get back nodes with their pins' types, DEFAULT VALUES (enum
+    literals like ObjectTypeQuery2, class pickers, object refs) and optional
+    connections. Paged via max_nodes/offset; total_matched tells you if more
+    remain. Use this instead of read_blueprint_content when you need to know
+    what a node is actually configured to do.
+    """
+    return _call("query_blueprint_graph", {
+        "blueprint_path": blueprint_path,
+        "graph_scope": graph_scope,
+        "node_filter": node_filter,
+        "include_pins": include_pins,
+        "include_connections": include_connections,
+        "max_nodes": max_nodes,
+        "offset": offset,
+    })
+
+
+@mcp.tool()
 def get_blueprint_variable_details(blueprint_path: str, variable_name: str = "") -> str:
     """Get detailed info about Blueprint variables (empty name = all variables)."""
     params: Dict[str, Any] = {"blueprint_path": blueprint_path}

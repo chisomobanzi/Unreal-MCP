@@ -1,5 +1,11 @@
 #include "Commands/EpicUnrealMCPEditorCommands.h"
 #include "Commands/EpicUnrealMCPCommonUtils.h"
+#include "Subsystems/EngineSubsystem.h"
+#include "Subsystems/GameInstanceSubsystem.h"
+#include "Subsystems/WorldSubsystem.h"
+#include "EditorSubsystem.h"
+#include "Engine/GameInstance.h"
+#include "UObject/StructOnScope.h"
 #include "Commands/EpicUnrealMCPBlueprintCommands.h"
 #include "Commands/EpicUnrealMCPPropertyUtils.h"
 #include "Subsystems/EditorActorSubsystem.h"
@@ -169,6 +175,10 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleCommand(
 	else if (CommandType == TEXT("hand_ray_click"))
 	{
 		return HandleHandRayClick(Params);
+	}
+	else if (CommandType == TEXT("call_subsystem"))
+	{
+		return HandleCallSubsystem(Params);
 	}
 
 	return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
@@ -2520,4 +2530,149 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleContactSheet(
 	Result->SetNumberField(TEXT("cell_height"), CellH);
 	Result->SetArrayField(TEXT("cells_row_major"), Labels);
 	return Result;
+}
+
+TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleCallSubsystem(
+	const TSharedPtr<FJsonObject>& Params)
+{
+	// Subsystems regardless of Python/BP exposure. Python-side subsystem resolution is a
+	// minefield (no World.get_game_instance, no GameInstance.get_subsystem, unbound classes
+	// invisible) — this resolves through C++ reflection instead, so any UFUNCTION on any
+	// subsystem is reachable. With no "function" it returns the subsystem's properties, which
+	// doubles as a read probe. Born 2026-08-19 after UTutorSelectionService proved unreachable.
+	FString ClassName;
+	if (!Params->TryGetStringField(TEXT("class_name"), ClassName))
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'class_name' parameter"));
+	}
+	FString Scope = TEXT("game_instance");
+	Params->TryGetStringField(TEXT("scope"), Scope);
+	FString FunctionName;
+	Params->TryGetStringField(TEXT("function"), FunctionName);
+
+	UClass* Class = FEpicUnrealMCPPropertyUtils::ResolveAnyClass(ClassName);
+	if (!Class)
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+			FString::Printf(TEXT("Class not found: %s"), *ClassName));
+	}
+
+	// Resolve the instance per scope. Game-instance and world scopes prefer the PIE world —
+	// that is where gameplay subsystems actually live; the editor world usually has no
+	// GameInstance, and answering from the wrong world is worse than erroring.
+	UObject* Instance = nullptr;
+	if (Scope.Equals(TEXT("engine"), ESearchCase::IgnoreCase))
+	{
+		if (Class->IsChildOf(UEngineSubsystem::StaticClass()) && GEngine)
+		{
+			Instance = GEngine->GetEngineSubsystemBase(Class);
+		}
+	}
+	else if (Scope.Equals(TEXT("editor"), ESearchCase::IgnoreCase))
+	{
+		if (Class->IsChildOf(UEditorSubsystem::StaticClass()) && GEditor)
+		{
+			Instance = GEditor->GetEditorSubsystemBase(Class);
+		}
+	}
+	else
+	{
+		UWorld* World = nullptr;
+		if (GEditor)
+		{
+			if (const FWorldContext* PIECtx = GEditor->GetPIEWorldContext())
+			{
+				World = PIECtx->World();
+			}
+		}
+		if (!World)
+		{
+			return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+				TEXT("No PIE world — game_instance/world subsystems need a running PIE session"));
+		}
+		if (Scope.Equals(TEXT("world"), ESearchCase::IgnoreCase))
+		{
+			if (Class->IsChildOf(UWorldSubsystem::StaticClass()))
+			{
+				Instance = World->GetSubsystemBase(Class);
+			}
+		}
+		else // game_instance
+		{
+			if (Class->IsChildOf(UGameInstanceSubsystem::StaticClass()) && World->GetGameInstance())
+			{
+				Instance = World->GetGameInstance()->GetSubsystemBase(Class);
+			}
+		}
+	}
+	if (!Instance)
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(
+			TEXT("No live '%s' subsystem in scope '%s' (check scope and that the class is a subsystem of that scope)"),
+			*ClassName, *Scope));
+	}
+
+	TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+	ResultObj->SetStringField(TEXT("class_name"), Instance->GetClass()->GetName());
+	ResultObj->SetStringField(TEXT("scope"), Scope);
+
+	if (FunctionName.IsEmpty())
+	{
+		// Read probe: every reflected property, no call.
+		ResultObj->SetObjectField(TEXT("properties"),
+			FEpicUnrealMCPPropertyUtils::SerializeAllProperties(Instance, FString(), /*bIncludeInherited*/ true));
+		ResultObj->SetBoolField(TEXT("success"), true);
+		return ResultObj;
+	}
+
+	UFunction* Function = Instance->GetClass()->FindFunctionByName(FName(*FunctionName));
+	if (!Function)
+	{
+		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(
+			TEXT("Function '%s' not found on %s"), *FunctionName, *Instance->GetClass()->GetName()));
+	}
+
+	// Param block: allocate, fill named inputs from JSON, call, then serialize return +
+	// out-params. SetPropertyValueAtAddr owns the JSON->FProperty coercion rules.
+	FStructOnScope FuncParams(Function);
+	const TSharedPtr<FJsonObject>* ArgsObj = nullptr;
+	Params->TryGetObjectField(TEXT("args"), ArgsObj);
+	for (TFieldIterator<FProperty> It(Function); It && It->HasAnyPropertyFlags(CPF_Parm); ++It)
+	{
+		FProperty* Param = *It;
+		if (Param->HasAnyPropertyFlags(CPF_ReturnParm | CPF_OutParm) &&
+			!Param->HasAnyPropertyFlags(CPF_ReferenceParm))
+		{
+			continue;
+		}
+		if (ArgsObj && (*ArgsObj)->HasField(Param->GetName()))
+		{
+			FString Error;
+			if (!FEpicUnrealMCPPropertyUtils::SetPropertyValueAtAddr(
+				Param, Param->ContainerPtrToValuePtr<void>(FuncParams.GetStructMemory()),
+				Instance, Param->GetName(),
+				(*ArgsObj)->TryGetField(Param->GetName()), Error))
+			{
+				return FEpicUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(
+					TEXT("Failed to set arg '%s': %s"), *Param->GetName(), *Error));
+			}
+		}
+	}
+
+	Instance->ProcessEvent(Function, FuncParams.GetStructMemory());
+
+	TSharedPtr<FJsonObject> Outputs = MakeShared<FJsonObject>();
+	for (TFieldIterator<FProperty> It(Function); It && It->HasAnyPropertyFlags(CPF_Parm); ++It)
+	{
+		FProperty* Param = *It;
+		if (Param->HasAnyPropertyFlags(CPF_ReturnParm | CPF_OutParm))
+		{
+			Outputs->SetField(Param->GetName(), FEpicUnrealMCPPropertyUtils::SafePropertyToJsonValue(
+				Param, Param->ContainerPtrToValuePtr<void>(FuncParams.GetStructMemory())));
+		}
+	}
+	ResultObj->SetStringField(TEXT("function"), FunctionName);
+	ResultObj->SetObjectField(TEXT("outputs"), Outputs);
+	ResultObj->SetBoolField(TEXT("success"), true);
+	return ResultObj;
 }

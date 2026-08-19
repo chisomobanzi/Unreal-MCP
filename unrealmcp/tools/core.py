@@ -37,6 +37,35 @@ def health_check() -> str:
 
 
 @mcp.tool()
+def call_subsystem(
+    class_name: str,
+    scope: str = "game_instance",
+    function: str = "",
+    args: dict | None = None,
+) -> str:
+    """Reach any UE subsystem through C++ reflection — no Python binding needed.
+
+    scope: "engine" | "editor" | "game_instance" | "world" (game_instance/world
+    resolve against the PIE world and error clearly when PIE isn't running).
+    With no `function`, returns the subsystem's reflected properties (a read
+    probe). With `function`, calls that UFUNCTION with `args` (a dict of
+    param-name -> value; struct/object coercion follows the same rules as
+    property-setting tools) and returns its return value and out-params.
+    Use when a subsystem or method has no Python/Blueprint exposure —
+    e.g. services that unreal.* cannot see at all.
+    """
+    params: dict = {"class_name": class_name, "scope": scope}
+    if function:
+        params["function"] = function
+    if args:
+        params["args"] = args
+    resp = _tcp_send_raw("call_subsystem", params)
+    if resp.get("status") == "error":
+        return f"Error: {resp.get('error', 'call_subsystem failed')}"
+    return json.dumps(resp.get("result", resp), indent=2)
+
+
+@mcp.tool()
 def set_unattended_mode(enabled: bool = True, dismiss_modals: bool = True) -> str:
     """Toggle the bridge's persistent non-interactive mode.
 

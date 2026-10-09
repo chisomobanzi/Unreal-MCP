@@ -113,20 +113,28 @@ class _SentThenTimeoutSocket:
 
 def test_no_retry_after_send(monkeypatch):
     monkeypatch.setattr(socket, "socket", _SentThenTimeoutSocket)
-    monkeypatch.setattr(time, "sleep", lambda s: None)
+    # After a lost reply the client polls the bridge journal (get_command_result)
+    # until a 15 s time.monotonic() deadline. A no-op sleep alone would spin
+    # that loop for 15 real seconds, so sleep advances a fake clock instead.
+    clock = {"t": 0.0}
+    monkeypatch.setattr(time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
     conn = tb._TCPConnection()
     conn._port = 51234  # skip discovery
-    sends = {"n": 0}
+    sends = {}
     orig = tb._TCPConnection._send_once
     def counting_send_once(self, command, params):
-        sends["n"] += 1
+        sends[command] = sends.get(command, 0) + 1
         return orig(self, command, params)
     monkeypatch.setattr(tb._TCPConnection, "_send_once", counting_send_once)
 
     resp = conn.send_command("spawn_actor", {"name": "X"})
     assert resp["status"] == "error"
     assert "NOT retrying" in resp["error"] or "not retrying" in resp["error"].lower()
-    assert sends["n"] == 1, "post-send failure must not be retried"
+    assert sends.get("spawn_actor") == 1, "post-send failure must not be retried"
+    # It asks the journal whether the command finished instead of re-sending it;
+    # this socket never answers, so the original error stands.
+    assert sends.get("get_command_result", 0) >= 1, "lost reply should consult the journal"
 
 
 class _RefusingSocket:

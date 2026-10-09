@@ -55,7 +55,7 @@ pip install unrealmcp
                     │                                          │
                     │   C++ Plugin (UnrealMCPBridge)           │
                     │   TCP server on localhost:55557           │
-                    │   318 commands: materials, blueprints,   │
+                    │   322 commands: materials, blueprints,   │
                     │   niagara, statetree, actors, playtest,  │
                     │   tables, profiling, and more            │
                     └──────────────┬───────────────────────────┘
@@ -72,7 +72,9 @@ pip install unrealmcp
           └───────────────────┘              └────────────────────┘
 ```
 
-The C++ plugin runs inside the editor and exposes 318 commands over TCP. The CLI and MCP server are two different front doors to the same plugin.
+The C++ plugin runs inside the editor and exposes 322 commands over TCP. The CLI and MCP server are two different front doors to the same plugin.
+
+A command whose reply is lost after it was sent is never re-sent, because it may still be running in the editor. The Python client tags each command with a `command_id`, and the bridge journals completed replies. On a lost reply the client asks `get_command_result` (a bridge command, answered even while the game thread is busy) for up to 15 s. It returns the journaled reply if the command finished, and an error otherwise.
 
 ---
 
@@ -439,7 +441,7 @@ The script asks where to create the MCP config:
 
 ---
 
-## All 318 Commands
+## All 322 Commands
 
 | Category | Count | Highlights |
 |----------|------:|-----------|

@@ -2238,6 +2238,43 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleExecuteConsoleComman
 		return FEpicUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'command' parameter"));
 	}
 
+	// QUIT_EDITOR must not run here. Commands execute inside the bridge's game-thread task, and with
+	// PIE up UUnrealEdEngine::CloseEditor -> EndPlayMap flushes the task graph from inside that task:
+	// "Assertion failed: ++Queue(QueueIndex).RecursionGuard == 1" (TaskGraph.cpp) — the editor
+	// crashes instead of quitting. Queue it instead: end PIE through the deferred path the Stop
+	// button uses, then quit from the core ticker, which runs outside any task once the frame ends.
+	const TCHAR* Cursor = *Command;
+	if (FParse::Command(&Cursor, TEXT("QUIT_EDITOR")))
+	{
+		const bool bPIE = GEditor && GEditor->PlayWorld;
+		if (bPIE)
+		{
+			GEditor->RequestEndPlayMap();
+		}
+		const double Deadline = FPlatformTime::Seconds() + 30.0;
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[Deadline](float) -> bool
+		{
+			if (GEditor && GEditor->PlayWorld && FPlatformTime::Seconds() < Deadline)
+			{
+				return true; // PIE still tearing down; past the deadline, quit anyway
+			}
+			UE_LOG(LogTemp, Display, TEXT("UnrealMCP: executing deferred QUIT_EDITOR"));
+			GEngine->Exec(FEpicUnrealMCPCommonUtils::GetEditorWorld(), TEXT("QUIT_EDITOR"));
+			return false; // one-shot
+		}));
+
+		TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+		Result->SetBoolField(TEXT("success"), true);
+		Result->SetBoolField(TEXT("handled"), true);
+		Result->SetBoolField(TEXT("deferred"), true);
+		Result->SetStringField(TEXT("command"), Command);
+		Result->SetStringField(TEXT("note"), bPIE
+			? TEXT("PIE end requested; the editor quits once PIE has ended (deferred out of the bridge task)")
+			: TEXT("the editor quits at the end of this frame (deferred out of the bridge task)"));
+		return Result;
+	}
+
 	UWorld* World = FEpicUnrealMCPCommonUtils::GetEditorWorld();
 	const bool bHandled = GEngine && GEngine->Exec(World, *Command);
 

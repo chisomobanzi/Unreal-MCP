@@ -328,6 +328,10 @@ def execute_console_command(command: str) -> str:
 
     Returns handled=false when the engine didn't recognize the command (note:
     some cvar writes report unhandled but still apply via the cvar sink).
+
+    QUIT_EDITOR is deferred (deferred=true in the reply): any PIE session is
+    ended first, then the editor quits after the reply is sent. Run inline it
+    crashed the editor whenever PIE was up.
     """
     return _call("execute_console_command", {"command": command})
 
